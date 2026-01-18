@@ -1,0 +1,10 @@
+# Binaries
+/codemap
+*.exe
+
+# Test artifacts
+*.test
+*.out
+
+# OS files
+.DS_Store

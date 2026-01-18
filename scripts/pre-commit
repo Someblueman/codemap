@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if ! root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+  exit 0
+fi
+
+# Only run when Go files are staged.
+if ! git diff --cached --name-only --diff-filter=ACMR | grep -qE '\\.go$'; then
+  exit 0
+fi
+
+# codemap must be installed and available in PATH.
+if ! command -v codemap >/dev/null 2>&1; then
+  echo "codemap not installed; skipping CODEMAP.paths generation" >&2
+  exit 0
+fi
+
+(cd "${root}" && codemap)
+(cd "${root}" && git add CODEMAP.md CODEMAP.paths)
