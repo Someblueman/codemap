@@ -103,6 +103,7 @@ chmod +x .git/hooks/pre-commit
 ```
 
 The installer also adds `.codemap.state.json` to the target repo `.gitignore`.
+If `CODEMAP.md` / `CODEMAP.paths` are ignored, the hook still refreshes them locally and skips staging.
 
 ## Performance Tracking
 
@@ -117,6 +118,34 @@ This records benchmark history in `perf/history.csv` and stores raw benchmark ou
 
 CI also runs codemap benchmarks via `.github/workflows/perf-bench.yml` and publishes artifacts per run.
 For persistent in-repo trend lines, run `./scripts/perf-record.sh` and commit the updated `perf/history.csv`.
+
+## Impact Measurement (Experimental)
+
+Use the built-in impact report script to measure codemap usage patterns across repos:
+
+```bash
+python3 ./scripts/impact-report.py --repo /path/to/repo --since 2026-01-01
+```
+
+This report tracks:
+
+- Codemap adoption rate (how often sessions touch `CODEMAP.paths` / `CODEMAP.md`)
+- Early-touch rate (whether codemap is used in the first few actions)
+- Speed-to-first-edit proxy (actions before first edit)
+- File-open proxy (unique `Read` paths before first edit; Claude logs)
+- Optional success metric from labeled outcomes
+
+You can include labeled outcomes to compute success-rate deltas:
+
+```csv
+source,session_id,success
+codex,019c4062-52f6-7601-a890-196d3b2a241a,1
+claude,7d2abdc1-f1c3-4f4b-b3cd-2cc75b2fb6f9,0
+```
+
+```bash
+python3 ./scripts/impact-report.py --repo /path/to/repo --outcomes-csv outcomes.csv
+```
 
 ## Excluded Directories
 
