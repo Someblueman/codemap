@@ -24,6 +24,7 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+          cache-dependency-path: go.mod
 
       - name: Run Unit Tests
         run: go test ./...
@@ -53,4 +54,3 @@ jobs:
             perf/history.csv
             perf/history/*.txt
           if-no-files-found: error
-
