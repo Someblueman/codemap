@@ -38,3 +38,6 @@ timestamp,commit,goos,goarch,goversion,benchmark,run,iterations,ns_per_op,bytes_
 2026-02-10T23:09:52Z,a56da08,darwin,arm64,go1.25.0,BenchmarkCodemapIsStaleWarm,1,700,1623240,564777,3211
 2026-02-10T23:09:52Z,a56da08,darwin,arm64,go1.25.0,BenchmarkCodemapEnsureUpToDateWarm,1,378,3184276,911001,5970
 2026-02-10T23:09:52Z,a56da08,darwin,arm64,go1.25.0,BenchmarkCodemapEnsureUpToDateOnChange,1,456,2535335,1098001,6114
+2026-02-10T23:31:28Z,bb0d5bc,darwin,arm64,go1.25.0,BenchmarkCodemapIsStaleWarm,1,1450,813957,299824,1971
+2026-02-10T23:31:28Z,bb0d5bc,darwin,arm64,go1.25.0,BenchmarkCodemapEnsureUpToDateWarm,1,1452,978330,302419,1971
+2026-02-10T23:31:28Z,bb0d5bc,darwin,arm64,go1.25.0,BenchmarkCodemapEnsureUpToDateOnChange,1,819,1691411,791912,3068

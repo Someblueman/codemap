@@ -100,22 +100,57 @@ func EnsureUpToDate(ctx context.Context, opts Options) (*Codemap, bool, error) {
 		opts.PathsOutputPath = pathsRenderer.DefaultPath()
 	}
 
-	idx, err := BuildFileIndex(ctx, root)
-	if err != nil {
-		return nil, false, fmt.Errorf("build file index: %w", err)
-	}
-
 	statePath := resolveStatePath(root, opts)
 	state, err := readState(statePath)
 	if err != nil {
 		return nil, false, fmt.Errorf("read state: %w", err)
 	}
-	currentHash, err := computeAggregateHashOnly(ctx, idx, state)
+
+	outputPath := filepath.Join(root, opts.OutputPath)
+	pathsPath := filepath.Join(root, opts.PathsOutputPath)
+	ignoredRootEntries := ignoredRootEntryNames(root, opts)
+
+	// Warm fast-path: if filesystem metadata still matches cached state, avoid full index/hash work.
+	currentHash, matchedFromState, err := aggregateHashFromFilesystemState(ctx, root, state, ignoredRootEntries)
+	if err != nil {
+		return nil, false, fmt.Errorf("verify state: %w", err)
+	}
+	if matchedFromState {
+		existingHash, err := ReadExistingHash(outputPath)
+		if err != nil {
+			return nil, false, fmt.Errorf("read existing hash: %w", err)
+		}
+		if existingHash != "" && existingHash == currentHash {
+			if opts.DisablePaths {
+				return nil, false, nil
+			}
+
+			existingPathsHash, err := ReadExistingHash(pathsPath)
+			if err != nil {
+				return nil, false, fmt.Errorf("read existing paths hash: %w", err)
+			}
+			if existingPathsHash != "" && existingPathsHash == currentHash {
+				return nil, false, nil
+			}
+		}
+	}
+
+	idx, _, err := buildFileIndexFromState(ctx, root, state, ignoredRootEntries)
+	if err != nil {
+		return nil, false, fmt.Errorf("build file index from state: %w", err)
+	}
+	if idx == nil {
+		idx, err = BuildFileIndex(ctx, root)
+		if err != nil {
+			return nil, false, fmt.Errorf("build file index: %w", err)
+		}
+	}
+	currentHash, nextState, err := computeAggregateHash(ctx, idx, state)
 	if err != nil {
 		return nil, false, fmt.Errorf("compute hash: %w", err)
 	}
 
-	outputPath := filepath.Join(root, opts.OutputPath)
+	// If full recompute still matches existing outputs, skip generation.
 	existingHash, err := ReadExistingHash(outputPath)
 	if err != nil {
 		return nil, false, fmt.Errorf("read existing hash: %w", err)
@@ -125,7 +160,6 @@ func EnsureUpToDate(ctx context.Context, opts Options) (*Codemap, bool, error) {
 			return nil, false, nil
 		}
 
-		pathsPath := filepath.Join(root, opts.PathsOutputPath)
 		existingPathsHash, err := ReadExistingHash(pathsPath)
 		if err != nil {
 			return nil, false, fmt.Errorf("read existing paths hash: %w", err)
@@ -133,11 +167,6 @@ func EnsureUpToDate(ctx context.Context, opts Options) (*Codemap, bool, error) {
 		if existingPathsHash != "" && existingPathsHash == currentHash {
 			return nil, false, nil
 		}
-	}
-
-	currentHash, nextState, err := computeAggregateHash(ctx, idx, state)
-	if err != nil {
-		return nil, false, fmt.Errorf("compute hash for write: %w", err)
 	}
 
 	analysisPath := resolveAnalysisStatePath(root, opts)
@@ -272,6 +301,7 @@ func writeRenderedOutput(outputPath string, renderer Renderer, cm *Codemap) erro
 	if err := os.WriteFile(outputPath, []byte(content), 0644); err != nil {
 		return fmt.Errorf("write %s output: %w", renderer.Name(), err)
 	}
+	cacheExistingHash(outputPath, cm.ContentHash)
 	return nil
 }
 

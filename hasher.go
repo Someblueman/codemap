@@ -15,11 +15,41 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 const (
 	codemapStateVersion    = 3
 	analysisCacheVersionV2 = 2
+)
+
+type cachedStateFile struct {
+	modTimeUnixNano int64
+	size            int64
+	state           *CodemapState
+}
+
+type cachedAnalysisFile struct {
+	modTimeUnixNano int64
+	size            int64
+	cache           *AnalysisCache
+}
+
+type cachedHashFile struct {
+	modTimeUnixNano int64
+	size            int64
+	hash            string
+}
+
+var (
+	stateFileCacheMu sync.RWMutex
+	stateFileCache   = make(map[string]cachedStateFile)
+
+	analysisFileCacheMu sync.RWMutex
+	analysisFileCache   = make(map[string]cachedAnalysisFile)
+
+	hashFileCacheMu sync.RWMutex
+	hashFileCache   = make(map[string]cachedHashFile)
 )
 
 // StateEntry stores per-file metadata for incremental hashing.
@@ -63,6 +93,49 @@ type CodemapState struct {
 	Analysis      *AnalysisCache  `json:"analysis,omitempty"`
 }
 
+func cloneCodemapState(state *CodemapState) *CodemapState {
+	if state == nil {
+		return nil
+	}
+	out := &CodemapState{
+		Version:       state.Version,
+		AggregateHash: state.AggregateHash,
+	}
+	if len(state.RootEntries) > 0 {
+		out.RootEntries = append([]string(nil), state.RootEntries...)
+	}
+	if len(state.Dirs) > 0 {
+		out.Dirs = append([]DirStateEntry(nil), state.Dirs...)
+	}
+	if len(state.Entries) > 0 {
+		out.Entries = append([]StateEntry(nil), state.Entries...)
+	}
+	if state.Analysis != nil {
+		out.Analysis = cloneAnalysisCache(state.Analysis)
+	}
+	return out
+}
+
+func cloneAnalysisCache(cache *AnalysisCache) *AnalysisCache {
+	if cache == nil {
+		return nil
+	}
+	out := &AnalysisCache{
+		Version:           cache.Version,
+		IncludeTests:      cache.IncludeTests,
+		LargePackageFiles: cache.LargePackageFiles,
+		ModulePath:        cache.ModulePath,
+	}
+	if len(cache.Packages) > 0 {
+		out.Packages = make([]CachedPackage, len(cache.Packages))
+		for i := range cache.Packages {
+			out.Packages[i] = cache.Packages[i]
+			out.Packages[i].FileRelPaths = append([]string(nil), cache.Packages[i].FileRelPaths...)
+		}
+	}
+	return out
+}
+
 // ComputeHash computes a deterministic hash of all Go files in the project.
 func ComputeHash(ctx context.Context, root string) (string, error) {
 	idx, err := BuildFileIndex(ctx, root)
@@ -79,19 +152,7 @@ func ComputeHash(ctx context.Context, root string) (string, error) {
 
 func computeAggregateHash(ctx context.Context, idx *FileIndex, prev *CodemapState) (string, *CodemapState, error) {
 	if aggregate, ok := aggregateHashFromState(idx, prev); ok {
-		rootEntries := make([]string, len(prev.RootEntries))
-		copy(rootEntries, prev.RootEntries)
-		dirs := make([]DirStateEntry, len(prev.Dirs))
-		copy(dirs, prev.Dirs)
-		entries := make([]StateEntry, len(prev.Entries))
-		copy(entries, prev.Entries)
-		return aggregate, &CodemapState{
-			Version:       codemapStateVersion,
-			AggregateHash: aggregate,
-			RootEntries:   rootEntries,
-			Dirs:          dirs,
-			Entries:       entries,
-		}, nil
+		return aggregate, cloneCodemapState(prev), nil
 	}
 
 	prevEntries := sortedStateEntries(prev)
@@ -235,6 +296,20 @@ func dirStateFromIndex(idx *FileIndex) []DirStateEntry {
 	return dirs
 }
 
+func dirRecordsFromState(dirs []DirStateEntry) []DirRecord {
+	if len(dirs) == 0 {
+		return nil
+	}
+	out := make([]DirRecord, len(dirs))
+	for i, dir := range dirs {
+		out[i] = DirRecord{
+			RelPath:         dir.RelPath,
+			ModTimeUnixNano: dir.ModTimeUnixNano,
+		}
+	}
+	return out
+}
+
 func rootEntriesFromIndex(idx *FileIndex) []string {
 	if idx == nil || len(idx.RootEntries) == 0 {
 		return nil
@@ -255,11 +330,39 @@ func aggregateHashFromFilesystemState(ctx context.Context, absRoot string, prev 
 		return "", false, nil
 	}
 
-	currentRootEntries, err := os.ReadDir(absRoot)
+	rootEntriesMatch, err := rootEntriesMatchState(absRoot, prev.RootEntries, ignoredRootEntries)
 	if err != nil {
 		return "", false, err
 	}
-	expectedRootEntries := filterRootEntries(prev.RootEntries, ignoredRootEntries)
+	if !rootEntriesMatch {
+		return "", false, nil
+	}
+
+	dirsMatch, err := directoriesMatchState(ctx, absRoot, prev.Dirs)
+	if err != nil {
+		return "", false, err
+	}
+	if !dirsMatch {
+		return "", false, nil
+	}
+
+	filesMatch, err := filesMatchState(ctx, absRoot, prev.Entries)
+	if err != nil {
+		return "", false, err
+	}
+	if !filesMatch {
+		return "", false, nil
+	}
+
+	return prev.AggregateHash, true, nil
+}
+
+func rootEntriesMatchState(absRoot string, expected []string, ignoredRootEntries map[string]struct{}) (bool, error) {
+	currentRootEntries, err := os.ReadDir(absRoot)
+	if err != nil {
+		return false, err
+	}
+	expectedRootEntries := filterRootEntries(expected, ignoredRootEntries)
 	actualRootEntries := make([]string, 0, len(currentRootEntries))
 	for _, entry := range currentRootEntries {
 		name := entry.Name()
@@ -269,18 +372,21 @@ func aggregateHashFromFilesystemState(ctx context.Context, absRoot string, prev 
 		actualRootEntries = append(actualRootEntries, name)
 	}
 	if len(actualRootEntries) != len(expectedRootEntries) {
-		return "", false, nil
+		return false, nil
 	}
 	for i := range actualRootEntries {
 		if actualRootEntries[i] != expectedRootEntries[i] {
-			return "", false, nil
+			return false, nil
 		}
 	}
+	return true, nil
+}
 
-	for _, dir := range prev.Dirs {
+func directoriesMatchState(ctx context.Context, absRoot string, dirs []DirStateEntry) (bool, error) {
+	for _, dir := range dirs {
 		select {
 		case <-ctx.Done():
-			return "", false, ctx.Err()
+			return false, ctx.Err()
 		default:
 		}
 
@@ -288,45 +394,250 @@ func aggregateHashFromFilesystemState(ctx context.Context, absRoot string, prev 
 		if dir.RelPath != "." {
 			absDir = filepath.Join(absRoot, filepath.FromSlash(dir.RelPath))
 		}
-		info, err := os.Stat(absDir)
+		info, err := os.Lstat(absDir)
 		if err != nil {
 			if os.IsNotExist(err) {
-				return "", false, nil
+				return false, nil
 			}
-			return "", false, err
+			return false, err
 		}
 		if !info.IsDir() || info.ModTime().UnixNano() != dir.ModTimeUnixNano {
-			return "", false, nil
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func filesMatchState(ctx context.Context, absRoot string, entries []StateEntry) (bool, error) {
+	if len(entries) == 0 {
+		return true, nil
+	}
+
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(entries) {
+		workers = len(entries)
+	}
+	if workers == 1 || len(entries) < 64 {
+		for _, entry := range entries {
+			select {
+			case <-ctx.Done():
+				return false, ctx.Err()
+			default:
+			}
+			matched, err := fileEntryMatches(absRoot, entry)
+			if err != nil {
+				return false, err
+			}
+			if !matched {
+				return false, nil
+			}
+		}
+		return true, nil
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	jobCh := make(chan int)
+	var mismatch atomic.Bool
+	errCh := make(chan error, 1)
+
+	var wg sync.WaitGroup
+	worker := func() {
+		defer wg.Done()
+		for idx := range jobCh {
+			if mismatch.Load() {
+				return
+			}
+			matched, err := fileEntryMatches(absRoot, entries[idx])
+			if err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				cancel()
+				return
+			}
+			if !matched {
+				mismatch.Store(true)
+				cancel()
+				return
+			}
 		}
 	}
 
-	for _, entry := range prev.Entries {
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go worker()
+	}
+
+dispatch:
+	for i := range entries {
 		select {
 		case <-ctx.Done():
-			return "", false, ctx.Err()
-		default:
+			break dispatch
+		case jobCh <- i:
 		}
+	}
+	close(jobCh)
+	wg.Wait()
 
-		absPath := filepath.Join(absRoot, filepath.FromSlash(entry.RelPath))
-		info, err := os.Stat(absPath)
-		if err != nil {
-			if os.IsNotExist(err) {
-				return "", false, nil
+	select {
+	case err := <-errCh:
+		return false, err
+	default:
+	}
+	if mismatch.Load() {
+		return false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		if errors.Is(err, context.Canceled) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	return true, nil
+}
+
+func fileEntryMatches(absRoot string, entry StateEntry) (bool, error) {
+	if !strings.HasSuffix(entry.RelPath, ".go") || entry.ContentHash == "" {
+		return false, nil
+	}
+
+	absPath := filepath.Join(absRoot, filepath.FromSlash(entry.RelPath))
+	info, err := os.Lstat(absPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if info.IsDir() {
+		return false, nil
+	}
+	return info.Size() == entry.Size && info.ModTime().UnixNano() == entry.ModTimeUnixNano, nil
+}
+
+func buildFileIndexFromState(ctx context.Context, absRoot string, prev *CodemapState, ignoredRootEntries map[string]struct{}) (*FileIndex, bool, error) {
+	if prev == nil || prev.Version != codemapStateVersion || len(prev.Entries) == 0 || prev.AggregateHash == "" {
+		return nil, false, nil
+	}
+
+	rootMatch, err := rootEntriesMatchState(absRoot, prev.RootEntries, ignoredRootEntries)
+	if err != nil {
+		return nil, false, err
+	}
+	if !rootMatch {
+		return nil, false, nil
+	}
+
+	dirsMatch, err := directoriesMatchState(ctx, absRoot, prev.Dirs)
+	if err != nil {
+		return nil, false, err
+	}
+	if !dirsMatch {
+		return nil, false, nil
+	}
+
+	fileRecords := make([]FileRecord, len(prev.Entries))
+	unchanged := atomic.Bool{}
+	unchanged.Store(true)
+	treeInvalid := atomic.Bool{}
+
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(prev.Entries) {
+		workers = len(prev.Entries)
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	jobCh := make(chan int)
+	errCh := make(chan error, 1)
+	var wg sync.WaitGroup
+	worker := func() {
+		defer wg.Done()
+		for idx := range jobCh {
+			entry := prev.Entries[idx]
+			absPath := filepath.Join(absRoot, filepath.FromSlash(entry.RelPath))
+			info, err := os.Lstat(absPath)
+			if err != nil {
+				if os.IsNotExist(err) {
+					treeInvalid.Store(true)
+					cancel()
+					return
+				}
+				select {
+				case errCh <- err:
+				default:
+				}
+				cancel()
+				return
 			}
-			return "", false, err
-		}
-		if info.IsDir() {
-			return "", false, nil
-		}
-		if info.Size() != entry.Size || info.ModTime().UnixNano() != entry.ModTimeUnixNano {
-			return "", false, nil
-		}
-		if !strings.HasSuffix(entry.RelPath, ".go") || entry.ContentHash == "" {
-			return "", false, nil
+			if info.IsDir() {
+				treeInvalid.Store(true)
+				cancel()
+				return
+			}
+
+			size := info.Size()
+			modTimeUnixNano := info.ModTime().UnixNano()
+			if size != entry.Size || modTimeUnixNano != entry.ModTimeUnixNano {
+				unchanged.Store(false)
+			}
+
+			fileRecords[idx] = FileRecord{
+				AbsPath:         absPath,
+				RelPath:         entry.RelPath,
+				Size:            size,
+				ModTimeUnixNano: modTimeUnixNano,
+				IsGo:            true,
+				IsTest:          strings.HasSuffix(entry.RelPath, "_test.go"),
+			}
 		}
 	}
 
-	return prev.AggregateHash, true, nil
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go worker()
+	}
+
+dispatch:
+	for i := range prev.Entries {
+		select {
+		case <-ctx.Done():
+			break dispatch
+		case jobCh <- i:
+		}
+	}
+	close(jobCh)
+	wg.Wait()
+
+	select {
+	case err := <-errCh:
+		return nil, false, err
+	default:
+	}
+	if treeInvalid.Load() {
+		return nil, false, nil
+	}
+	if err := ctx.Err(); err != nil && !errors.Is(err, context.Canceled) {
+		return nil, false, err
+	}
+
+	return &FileIndex{
+		Root:        absRoot,
+		RootEntries: append([]string(nil), prev.RootEntries...),
+		Dirs:        dirRecordsFromState(prev.Dirs),
+		Files:       fileRecords,
+	}, unchanged.Load(), nil
 }
 
 func filterRootEntries(entries []string, ignored map[string]struct{}) []string {
@@ -509,9 +820,30 @@ func hashFileContents(path string) (string, error) {
 }
 
 func readState(path string) (*CodemapState, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			stateFileCacheMu.Lock()
+			delete(stateFileCache, path)
+			stateFileCacheMu.Unlock()
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	stateFileCacheMu.RLock()
+	cached, ok := stateFileCache[path]
+	stateFileCacheMu.RUnlock()
+	if ok && cached.modTimeUnixNano == info.ModTime().UnixNano() && cached.size == info.Size() {
+		return cached.state, nil
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			stateFileCacheMu.Lock()
+			delete(stateFileCache, path)
+			stateFileCacheMu.Unlock()
 			return nil, nil
 		}
 		return nil, err
@@ -537,7 +869,16 @@ func readState(path string) (*CodemapState, error) {
 			return state.Analysis.Packages[i].RelativePath < state.Analysis.Packages[j].RelativePath
 		})
 	}
-	return &state, nil
+
+	cloned := cloneCodemapState(&state)
+	stateFileCacheMu.Lock()
+	stateFileCache[path] = cachedStateFile{
+		modTimeUnixNano: info.ModTime().UnixNano(),
+		size:            info.Size(),
+		state:           cloned,
+	}
+	stateFileCacheMu.Unlock()
+	return cloned, nil
 }
 
 func writeState(path string, state *CodemapState) error {
@@ -562,6 +903,17 @@ func writeState(path string, state *CodemapState) error {
 	if err := os.Rename(tmpPath, path); err != nil {
 		_ = os.Remove(tmpPath)
 		return err
+	}
+
+	if info, err := os.Stat(path); err == nil {
+		cachedCopy := cloneCodemapState(&stateForDisk)
+		stateFileCacheMu.Lock()
+		stateFileCache[path] = cachedStateFile{
+			modTimeUnixNano: info.ModTime().UnixNano(),
+			size:            info.Size(),
+			state:           cachedCopy,
+		}
+		stateFileCacheMu.Unlock()
 	}
 	return nil
 }
@@ -588,9 +940,30 @@ func resolveAnalysisStatePath(root string, opts Options) string {
 }
 
 func readAnalysisCache(path string) (*AnalysisCache, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			analysisFileCacheMu.Lock()
+			delete(analysisFileCache, path)
+			analysisFileCacheMu.Unlock()
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	analysisFileCacheMu.RLock()
+	cached, ok := analysisFileCache[path]
+	analysisFileCacheMu.RUnlock()
+	if ok && cached.modTimeUnixNano == info.ModTime().UnixNano() && cached.size == info.Size() {
+		return cached.cache, nil
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			analysisFileCacheMu.Lock()
+			delete(analysisFileCache, path)
+			analysisFileCacheMu.Unlock()
 			return nil, nil
 		}
 		return nil, err
@@ -606,7 +979,16 @@ func readAnalysisCache(path string) (*AnalysisCache, error) {
 	sort.Slice(cache.Packages, func(i, j int) bool {
 		return cache.Packages[i].RelativePath < cache.Packages[j].RelativePath
 	})
-	return &cache, nil
+
+	cacheCopy := cloneAnalysisCache(&cache)
+	analysisFileCacheMu.Lock()
+	analysisFileCache[path] = cachedAnalysisFile{
+		modTimeUnixNano: info.ModTime().UnixNano(),
+		size:            info.Size(),
+		cache:           cacheCopy,
+	}
+	analysisFileCacheMu.Unlock()
+	return cacheCopy, nil
 }
 
 func writeAnalysisCache(path string, cache *AnalysisCache) error {
@@ -614,6 +996,9 @@ func writeAnalysisCache(path string, cache *AnalysisCache) error {
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			return err
 		}
+		analysisFileCacheMu.Lock()
+		delete(analysisFileCache, path)
+		analysisFileCacheMu.Unlock()
 		return nil
 	}
 
@@ -631,14 +1016,46 @@ func writeAnalysisCache(path string, cache *AnalysisCache) error {
 		_ = os.Remove(tmpPath)
 		return err
 	}
+
+	if info, err := os.Stat(path); err == nil {
+		cacheCopy := cloneAnalysisCache(cache)
+		analysisFileCacheMu.Lock()
+		analysisFileCache[path] = cachedAnalysisFile{
+			modTimeUnixNano: info.ModTime().UnixNano(),
+			size:            info.Size(),
+			cache:           cacheCopy,
+		}
+		analysisFileCacheMu.Unlock()
+	}
 	return nil
 }
 
 // ReadExistingHash reads the hash from an existing codemap output file.
 func ReadExistingHash(path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			hashFileCacheMu.Lock()
+			delete(hashFileCache, path)
+			hashFileCacheMu.Unlock()
+			return "", nil
+		}
+		return "", err
+	}
+
+	hashFileCacheMu.RLock()
+	cached, ok := hashFileCache[path]
+	hashFileCacheMu.RUnlock()
+	if ok && cached.modTimeUnixNano == info.ModTime().UnixNano() && cached.size == info.Size() {
+		return cached.hash, nil
+	}
+
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			hashFileCacheMu.Lock()
+			delete(hashFileCache, path)
+			hashFileCacheMu.Unlock()
 			return "", nil
 		}
 		return "", err
@@ -651,6 +1068,13 @@ func ReadExistingHash(path string) (string, error) {
 		linesChecked++
 		line := scanner.Text()
 		if hash := parseHashLine(line); hash != "" {
+			hashFileCacheMu.Lock()
+			hashFileCache[path] = cachedHashFile{
+				modTimeUnixNano: info.ModTime().UnixNano(),
+				size:            info.Size(),
+				hash:            hash,
+			}
+			hashFileCacheMu.Unlock()
 			return hash, nil
 		}
 		if linesChecked >= 20 {
@@ -662,6 +1086,13 @@ func ReadExistingHash(path string) (string, error) {
 		return "", err
 	}
 
+	hashFileCacheMu.Lock()
+	hashFileCache[path] = cachedHashFile{
+		modTimeUnixNano: info.ModTime().UnixNano(),
+		size:            info.Size(),
+		hash:            "",
+	}
+	hashFileCacheMu.Unlock()
 	return "", nil
 }
 
@@ -698,6 +1129,20 @@ func parseHashLine(line string) string {
 		}
 	}
 	return hash
+}
+
+func cacheExistingHash(path, hash string) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return
+	}
+	hashFileCacheMu.Lock()
+	hashFileCache[path] = cachedHashFile{
+		modTimeUnixNano: info.ModTime().UnixNano(),
+		size:            info.Size(),
+		hash:            hash,
+	}
+	hashFileCacheMu.Unlock()
 }
 
 // IsStale checks if codemap outputs are stale.
@@ -739,14 +1184,21 @@ func IsStale(ctx context.Context, opts Options) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("read state: %w", err)
 	}
-	currentHash, matchedFromState, err := aggregateHashFromFilesystemState(ctx, root, state, ignoredRootEntryNames(root, opts))
+	ignoredRootEntries := ignoredRootEntryNames(root, opts)
+	currentHash, matchedFromState, err := aggregateHashFromFilesystemState(ctx, root, state, ignoredRootEntries)
 	if err != nil {
 		return false, fmt.Errorf("verify state: %w", err)
 	}
 	if !matchedFromState {
-		idx, err := BuildFileIndex(ctx, root)
+		idx, _, err := buildFileIndexFromState(ctx, root, state, ignoredRootEntries)
 		if err != nil {
-			return false, fmt.Errorf("build file index: %w", err)
+			return false, fmt.Errorf("build file index from state: %w", err)
+		}
+		if idx == nil {
+			idx, err = BuildFileIndex(ctx, root)
+			if err != nil {
+				return false, fmt.Errorf("build file index: %w", err)
+			}
 		}
 		currentHash, err = computeAggregateHashOnly(ctx, idx, state)
 		if err != nil {
