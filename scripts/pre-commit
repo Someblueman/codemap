@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export PATH="$PATH:$HOME/go/bin"
+
 if ! root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
   exit 0
 fi
 
 # Only run when Go files are staged.
-if ! git diff --cached --name-only --diff-filter=ACMR | grep -qE '\\.go$'; then
+if ! git diff --cached --name-only --diff-filter=ACMR | grep -qE '\.go$'; then
   exit 0
 fi
 
