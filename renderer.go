@@ -91,19 +91,30 @@ func EnsureUpToDate(ctx context.Context, opts Options) (*Codemap, bool, error) {
 		return nil, false, fmt.Errorf("resolve root: %w", err)
 	}
 
+	markdownRenderer := MarkdownRenderer{}
+	pathsRenderer := PathsRenderer{}
 	if opts.OutputPath == "" {
-		opts.OutputPath = "CODEMAP.md"
+		opts.OutputPath = markdownRenderer.DefaultPath()
 	}
 	if opts.PathsOutputPath == "" {
-		opts.PathsOutputPath = "CODEMAP.paths"
+		opts.PathsOutputPath = pathsRenderer.DefaultPath()
 	}
 
-	currentHash, err := ComputeHash(ctx, root)
+	idx, err := BuildFileIndex(ctx, root)
+	if err != nil {
+		return nil, false, fmt.Errorf("build file index: %w", err)
+	}
+
+	statePath := resolveStatePath(root, opts)
+	state, err := readState(statePath)
+	if err != nil {
+		return nil, false, fmt.Errorf("read state: %w", err)
+	}
+	currentHash, nextState, err := computeAggregateHash(ctx, idx, state)
 	if err != nil {
 		return nil, false, fmt.Errorf("compute hash: %w", err)
 	}
 
-	// Avoid expensive analysis if outputs are up to date.
 	outputPath := filepath.Join(root, opts.OutputPath)
 	existingHash, err := ReadExistingHash(outputPath)
 	if err != nil {
@@ -124,8 +135,12 @@ func EnsureUpToDate(ctx context.Context, opts Options) (*Codemap, bool, error) {
 		}
 	}
 
-	// Analyze the codebase
-	cm, err := Analyze(ctx, opts)
+	analyzer := GoAnalyzer{}
+	cm, err := analyzer.Analyze(ctx, AnalysisInput{
+		Root:    root,
+		Index:   idx,
+		Options: opts,
+	})
 	if err != nil {
 		return nil, false, fmt.Errorf("analyze: %w", err)
 	}
@@ -133,24 +148,17 @@ func EnsureUpToDate(ctx context.Context, opts Options) (*Codemap, bool, error) {
 	cm.ContentHash = currentHash
 	cm.GeneratedAt = time.Now().UTC()
 
-	// Render markdown output
-	content, err := Render(cm)
-	if err != nil {
-		return nil, false, fmt.Errorf("render: %w", err)
+	if err := writeRenderedOutput(outputPath, markdownRenderer, cm); err != nil {
+		return nil, false, err
 	}
-
-	// Write markdown output
-	if err := os.WriteFile(outputPath, []byte(content), 0644); err != nil {
-		return nil, false, fmt.Errorf("write output: %w", err)
-	}
-
-	// Write paths output
 	if !opts.DisablePaths {
-		pathsContent := RenderPaths(cm)
 		pathsPath := filepath.Join(root, opts.PathsOutputPath)
-		if err := os.WriteFile(pathsPath, []byte(pathsContent), 0644); err != nil {
-			return nil, false, fmt.Errorf("write paths output: %w", err)
+		if err := writeRenderedOutput(pathsPath, pathsRenderer, cm); err != nil {
+			return nil, false, err
 		}
+	}
+	if err := writeState(statePath, nextState); err != nil {
+		return nil, false, fmt.Errorf("write state: %w", err)
 	}
 
 	return cm, true, nil
@@ -158,55 +166,74 @@ func EnsureUpToDate(ctx context.Context, opts Options) (*Codemap, bool, error) {
 
 // Generate creates or updates the codemap outputs (always regenerates).
 func Generate(ctx context.Context, opts Options) (*Codemap, error) {
-	// Analyze the codebase
-	cm, err := Analyze(ctx, opts)
-	if err != nil {
-		return nil, fmt.Errorf("analyze: %w", err)
-	}
-
-	// Compute hash
 	root, err := filepath.Abs(opts.ProjectRoot)
 	if err != nil {
 		return nil, fmt.Errorf("resolve root: %w", err)
 	}
 
-	hash, err := ComputeHash(ctx, root)
+	markdownRenderer := MarkdownRenderer{}
+	pathsRenderer := PathsRenderer{}
+	if opts.OutputPath == "" {
+		opts.OutputPath = markdownRenderer.DefaultPath()
+	}
+	if opts.PathsOutputPath == "" {
+		opts.PathsOutputPath = pathsRenderer.DefaultPath()
+	}
+
+	idx, err := BuildFileIndex(ctx, root)
+	if err != nil {
+		return nil, fmt.Errorf("build file index: %w", err)
+	}
+
+	statePath := resolveStatePath(root, opts)
+	state, err := readState(statePath)
+	if err != nil {
+		return nil, fmt.Errorf("read state: %w", err)
+	}
+	hash, nextState, err := computeAggregateHash(ctx, idx, state)
 	if err != nil {
 		return nil, fmt.Errorf("compute hash: %w", err)
+	}
+
+	analyzer := GoAnalyzer{}
+	cm, err := analyzer.Analyze(ctx, AnalysisInput{
+		Root:    root,
+		Index:   idx,
+		Options: opts,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("analyze: %w", err)
 	}
 
 	cm.ContentHash = hash
 	cm.GeneratedAt = time.Now().UTC()
 
-	// Render
-	content, err := Render(cm)
-	if err != nil {
-		return nil, fmt.Errorf("render: %w", err)
-	}
-
-	if opts.OutputPath == "" {
-		opts.OutputPath = "CODEMAP.md"
-	}
-	if opts.PathsOutputPath == "" {
-		opts.PathsOutputPath = "CODEMAP.paths"
-	}
-
-	// Write markdown output
 	outputPath := filepath.Join(root, opts.OutputPath)
-	if err := os.WriteFile(outputPath, []byte(content), 0644); err != nil {
-		return nil, fmt.Errorf("write output: %w", err)
+	if err := writeRenderedOutput(outputPath, markdownRenderer, cm); err != nil {
+		return nil, err
 	}
-
-	// Write paths output
 	if !opts.DisablePaths {
-		pathsContent := RenderPaths(cm)
 		pathsPath := filepath.Join(root, opts.PathsOutputPath)
-		if err := os.WriteFile(pathsPath, []byte(pathsContent), 0644); err != nil {
-			return nil, fmt.Errorf("write paths output: %w", err)
+		if err := writeRenderedOutput(pathsPath, pathsRenderer, cm); err != nil {
+			return nil, err
 		}
+	}
+	if err := writeState(statePath, nextState); err != nil {
+		return nil, fmt.Errorf("write state: %w", err)
 	}
 
 	return cm, nil
+}
+
+func writeRenderedOutput(outputPath string, renderer Renderer, cm *Codemap) error {
+	content, err := renderer.Render(cm)
+	if err != nil {
+		return fmt.Errorf("render %s: %w", renderer.Name(), err)
+	}
+	if err := os.WriteFile(outputPath, []byte(content), 0644); err != nil {
+		return fmt.Errorf("write %s output: %w", renderer.Name(), err)
+	}
+	return nil
 }
 
 func truncate(s string, maxLen int) string {

@@ -67,6 +67,7 @@ The generated outputs include:
 
 - `CODEMAP.paths`: One line per package with a suggested entry file (and optional short purpose).
 - `CODEMAP.md`: A small summary table with package entry points, plus a brief concern count summary.
+- `.codemap.state.json`: Local incremental hash cache used to speed up `codemap -check` and unchanged runs.
 
 Example output:
 
@@ -100,6 +101,22 @@ Or copy the hook template:
 cp /path/to/codemap/scripts/pre-commit .git/hooks/pre-commit
 chmod +x .git/hooks/pre-commit
 ```
+
+The installer also adds `.codemap.state.json` to the target repo `.gitignore`.
+
+## Performance Tracking
+
+You can track codemap performance over time using built-in benchmarks:
+
+```bash
+./scripts/perf-record.sh
+./scripts/perf-report.sh
+```
+
+This records benchmark history in `perf/history.csv` and stores raw benchmark outputs in `perf/history/`.
+
+CI also runs codemap benchmarks via `.github/workflows/perf-bench.yml` and publishes artifacts per run.
+For persistent in-repo trend lines, run `./scripts/perf-record.sh` and commit the updated `perf/history.csv`.
 
 ## Excluded Directories
 

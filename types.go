@@ -60,6 +60,7 @@ type Options struct {
 	ProjectRoot         string
 	OutputPath          string // Default: "CODEMAP.md"
 	PathsOutputPath     string // Default: "CODEMAP.paths"
+	StatePath           string // Default: ".codemap.state.json"
 	LargePackageFiles   int    // Threshold for detailed file listing
 	IncludeTests        bool
 	Concerns            []ConcernDef
@@ -74,6 +75,7 @@ func DefaultOptions() Options {
 		ProjectRoot:         ".",
 		OutputPath:          "CODEMAP.md",
 		PathsOutputPath:     "CODEMAP.paths",
+		StatePath:           ".codemap.state.json",
 		LargePackageFiles:   10,
 		IncludeTests:        false,
 		Concerns:            defaultConcerns,

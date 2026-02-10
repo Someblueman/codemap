@@ -5,77 +5,167 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strings"
 )
 
-// ComputeHash computes a SHA256 hash of all Go files in the project.
+const codemapStateVersion = 1
+
+// StateEntry stores per-file metadata for incremental hashing.
+type StateEntry struct {
+	RelPath         string `json:"relPath"`
+	Size            int64  `json:"size"`
+	ModTimeUnixNano int64  `json:"modTimeUnixNano"`
+	ContentHash     string `json:"contentHash"`
+}
+
+// CodemapState stores local cache metadata for staleness checks.
+type CodemapState struct {
+	Version       int          `json:"version"`
+	AggregateHash string       `json:"aggregateHash"`
+	Entries       []StateEntry `json:"entries"`
+}
+
+// ComputeHash computes a deterministic hash of all Go files in the project.
 func ComputeHash(ctx context.Context, root string) (string, error) {
-	var files []string
-
-	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		name := info.Name()
-		if info.IsDir() {
-			if strings.HasPrefix(name, ".") || name == "vendor" || name == "testdata" || name == "workspace" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		if strings.HasSuffix(name, ".go") {
-			files = append(files, path)
-		}
-		return nil
-	})
+	idx, err := BuildFileIndex(ctx, root)
 	if err != nil {
-		return "", fmt.Errorf("walk directory: %w", err)
+		return "", fmt.Errorf("build file index: %w", err)
 	}
 
-	// Sort for determinism
-	sort.Strings(files)
+	hash, _, err := computeAggregateHash(ctx, idx, nil)
+	if err != nil {
+		return "", err
+	}
+	return hash, nil
+}
+
+func computeAggregateHash(ctx context.Context, idx *FileIndex, prev *CodemapState) (string, *CodemapState, error) {
+	prevByPath := make(map[string]StateEntry)
+	if prev != nil && prev.Version == codemapStateVersion {
+		for _, entry := range prev.Entries {
+			prevByPath[entry.RelPath] = entry
+		}
+	}
 
 	h := sha256.New()
+	entries := make([]StateEntry, 0, len(idx.Files))
+	for _, rec := range idx.Files {
+		if !rec.IsGo {
+			continue
+		}
 
-	for _, file := range files {
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return "", nil, ctx.Err()
 		default:
 		}
 
-		// Include relative path in hash
-		rel, err := filepath.Rel(root, file)
-		if err != nil {
-			rel = file
+		entry := StateEntry{
+			RelPath:         rec.RelPath,
+			Size:            rec.Size,
+			ModTimeUnixNano: rec.ModTimeUnixNano,
 		}
-		h.Write([]byte(rel))
+
+		if cached, ok := prevByPath[rec.RelPath]; ok && cached.Size == rec.Size && cached.ModTimeUnixNano == rec.ModTimeUnixNano && cached.ContentHash != "" {
+			entry.ContentHash = cached.ContentHash
+		} else {
+			contentHash, err := hashFileContents(rec.AbsPath)
+			if err != nil {
+				return "", nil, fmt.Errorf("hash %s: %w", rec.RelPath, err)
+			}
+			entry.ContentHash = contentHash
+		}
+
+		entries = append(entries, entry)
+		h.Write([]byte(entry.RelPath))
 		h.Write([]byte{0})
-
-		// Include file contents
-		f, err := os.Open(file)
-		if err != nil {
-			return "", fmt.Errorf("open %s: %w", file, err)
-		}
-
-		if _, err := io.Copy(h, f); err != nil {
-			f.Close()
-			return "", fmt.Errorf("read %s: %w", file, err)
-		}
-		f.Close()
-
+		h.Write([]byte(entry.ContentHash))
 		h.Write([]byte{0})
 	}
 
+	aggregate := hex.EncodeToString(h.Sum(nil))
+	next := &CodemapState{
+		Version:       codemapStateVersion,
+		AggregateHash: aggregate,
+		Entries:       entries,
+	}
+	return aggregate, next, nil
+}
+
+func hashFileContents(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func readState(path string) (*CodemapState, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var state CodemapState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return nil, nil
+	}
+	if state.Version != codemapStateVersion {
+		return nil, nil
+	}
+
+	sort.Slice(state.Entries, func(i, j int) bool {
+		return state.Entries[i].RelPath < state.Entries[j].RelPath
+	})
+	return &state, nil
+}
+
+func writeState(path string, state *CodemapState) error {
+	if state == nil {
+		return nil
+	}
+
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
+}
+
+func resolveStatePath(root string, opts Options) string {
+	statePath := opts.StatePath
+	if statePath == "" {
+		statePath = ".codemap.state.json"
+	}
+	if filepath.IsAbs(statePath) {
+		return statePath
+	}
+	return filepath.Join(root, statePath)
 }
 
 var hashPattern = regexp.MustCompile(`^(?:<!--\s*|#\s*)?codemap-hash:\s*([a-f0-9]+)\s*(?:-->)?\s*$`)
@@ -99,7 +189,6 @@ func ReadExistingHash(path string) (string, error) {
 		if matches := hashPattern.FindStringSubmatch(line); len(matches) > 1 {
 			return matches[1], nil
 		}
-		// Only check first 20 lines
 		if linesChecked >= 20 {
 			break
 		}
@@ -112,7 +201,7 @@ func ReadExistingHash(path string) (string, error) {
 	return "", nil
 }
 
-// IsStale checks if the CODEMAP.md file is stale.
+// IsStale checks if codemap outputs are stale.
 func IsStale(ctx context.Context, opts Options) (bool, error) {
 	root, err := filepath.Abs(opts.ProjectRoot)
 	if err != nil {
@@ -127,14 +216,10 @@ func IsStale(ctx context.Context, opts Options) (bool, error) {
 	}
 
 	outputPath := filepath.Join(root, opts.OutputPath)
-
-	// Read existing hash
 	existingHash, err := ReadExistingHash(outputPath)
 	if err != nil {
 		return false, fmt.Errorf("read existing hash: %w", err)
 	}
-
-	// No existing file or no hash found
 	if existingHash == "" {
 		return true, nil
 	}
@@ -151,8 +236,16 @@ func IsStale(ctx context.Context, opts Options) (bool, error) {
 		}
 	}
 
-	// Compute current hash
-	currentHash, err := ComputeHash(ctx, root)
+	idx, err := BuildFileIndex(ctx, root)
+	if err != nil {
+		return false, fmt.Errorf("build file index: %w", err)
+	}
+
+	state, err := readState(resolveStatePath(root, opts))
+	if err != nil {
+		return false, fmt.Errorf("read state: %w", err)
+	}
+	currentHash, _, err := computeAggregateHash(ctx, idx, state)
 	if err != nil {
 		return false, fmt.Errorf("compute hash: %w", err)
 	}
