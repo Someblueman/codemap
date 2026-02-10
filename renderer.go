@@ -110,7 +110,7 @@ func EnsureUpToDate(ctx context.Context, opts Options) (*Codemap, bool, error) {
 	if err != nil {
 		return nil, false, fmt.Errorf("read state: %w", err)
 	}
-	currentHash, nextState, err := computeAggregateHash(ctx, idx, state)
+	currentHash, err := computeAggregateHashOnly(ctx, idx, state)
 	if err != nil {
 		return nil, false, fmt.Errorf("compute hash: %w", err)
 	}
@@ -135,11 +135,25 @@ func EnsureUpToDate(ctx context.Context, opts Options) (*Codemap, bool, error) {
 		}
 	}
 
+	currentHash, nextState, err := computeAggregateHash(ctx, idx, state)
+	if err != nil {
+		return nil, false, fmt.Errorf("compute hash for write: %w", err)
+	}
+
+	analysisPath := resolveAnalysisStatePath(root, opts)
+	analysisCache, err := readAnalysisCache(analysisPath)
+	if err != nil {
+		return nil, false, fmt.Errorf("read analysis cache: %w", err)
+	}
+	prevState := mergeStateWithAnalysis(state, analysisCache)
+
 	analyzer := GoAnalyzer{}
 	cm, err := analyzer.Analyze(ctx, AnalysisInput{
-		Root:    root,
-		Index:   idx,
-		Options: opts,
+		Root:      root,
+		Index:     idx,
+		Options:   opts,
+		PrevState: prevState,
+		NextState: nextState,
 	})
 	if err != nil {
 		return nil, false, fmt.Errorf("analyze: %w", err)
@@ -159,6 +173,9 @@ func EnsureUpToDate(ctx context.Context, opts Options) (*Codemap, bool, error) {
 	}
 	if err := writeState(statePath, nextState); err != nil {
 		return nil, false, fmt.Errorf("write state: %w", err)
+	}
+	if err := writeAnalysisCache(analysisPath, nextState.Analysis); err != nil {
+		return nil, false, fmt.Errorf("write analysis cache: %w", err)
 	}
 
 	return cm, true, nil
@@ -190,16 +207,26 @@ func Generate(ctx context.Context, opts Options) (*Codemap, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read state: %w", err)
 	}
+
+	analysisPath := resolveAnalysisStatePath(root, opts)
+	analysisCache, err := readAnalysisCache(analysisPath)
+	if err != nil {
+		return nil, fmt.Errorf("read analysis cache: %w", err)
+	}
+
 	hash, nextState, err := computeAggregateHash(ctx, idx, state)
 	if err != nil {
 		return nil, fmt.Errorf("compute hash: %w", err)
 	}
 
+	prevState := mergeStateWithAnalysis(state, analysisCache)
 	analyzer := GoAnalyzer{}
 	cm, err := analyzer.Analyze(ctx, AnalysisInput{
-		Root:    root,
-		Index:   idx,
-		Options: opts,
+		Root:      root,
+		Index:     idx,
+		Options:   opts,
+		PrevState: prevState,
+		NextState: nextState,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("analyze: %w", err)
@@ -221,8 +248,20 @@ func Generate(ctx context.Context, opts Options) (*Codemap, error) {
 	if err := writeState(statePath, nextState); err != nil {
 		return nil, fmt.Errorf("write state: %w", err)
 	}
+	if err := writeAnalysisCache(analysisPath, nextState.Analysis); err != nil {
+		return nil, fmt.Errorf("write analysis cache: %w", err)
+	}
 
 	return cm, nil
+}
+
+func mergeStateWithAnalysis(state *CodemapState, analysis *AnalysisCache) *CodemapState {
+	if state == nil || analysis == nil {
+		return state
+	}
+	copy := *state
+	copy.Analysis = analysis
+	return &copy
 }
 
 func writeRenderedOutput(outputPath string, renderer Renderer, cm *Codemap) error {
