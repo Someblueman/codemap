@@ -8,6 +8,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -15,16 +16,21 @@ import (
 
 // Analyze walks the project and extracts package information.
 func Analyze(ctx context.Context, opts Options) (*Codemap, error) {
-	root, err := filepath.Abs(opts.ProjectRoot)
+	idx, err := BuildFileIndex(ctx, opts.ProjectRoot)
 	if err != nil {
-		return nil, fmt.Errorf("resolve project root: %w", err)
+		return nil, fmt.Errorf("build file index: %w", err)
 	}
 
-	// Find all Go packages
-	pkgDirs, err := findPackageDirs(root, opts.IncludeTests)
-	if err != nil {
-		return nil, fmt.Errorf("find packages: %w", err)
-	}
+	analyzer := GoAnalyzer{}
+	return analyzer.Analyze(ctx, AnalysisInput{
+		Root:    idx.Root,
+		Index:   idx,
+		Options: opts,
+	})
+}
+
+func analyzeGoWithIndex(ctx context.Context, root string, idx *FileIndex, opts Options) (*Codemap, error) {
+	pkgDirs := findPackageDirsFromIndex(idx, opts.IncludeTests)
 
 	var packages []Package
 	fset := token.NewFileSet()
@@ -49,13 +55,11 @@ func Analyze(ctx context.Context, opts Options) (*Codemap, error) {
 		}
 	}
 
-	// Sort by relative path
 	sort.Slice(packages, func(i, j int) bool {
 		return packages[i].RelativePath < packages[j].RelativePath
 	})
 
-	// Build concerns from file patterns
-	concerns, err := buildConcerns(root, opts.Concerns, opts.ConcernExampleLimit)
+	concerns, err := buildConcerns(idx, opts.Concerns, opts.ConcernExampleLimit)
 	if err != nil {
 		return nil, fmt.Errorf("build concerns: %w", err)
 	}
@@ -67,48 +71,28 @@ func Analyze(ctx context.Context, opts Options) (*Codemap, error) {
 	}, nil
 }
 
-func findPackageDirs(root string, includeTests bool) ([]string, error) {
-	var dirs []string
-	seen := make(map[string]bool)
-
-	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
+func findPackageDirsFromIndex(idx *FileIndex, includeTests bool) []string {
+	seen := make(map[string]struct{})
+	for _, rec := range idx.Files {
+		if !rec.IsGo {
+			continue
 		}
-
-		// Skip hidden directories and vendor
-		name := info.Name()
-		if info.IsDir() {
-			if strings.HasPrefix(name, ".") || name == "vendor" || name == "testdata" || name == "workspace" {
-				return filepath.SkipDir
-			}
-			return nil
+		if !includeTests && rec.IsTest {
+			continue
 		}
+		dir := filepath.Dir(rec.AbsPath)
+		seen[dir] = struct{}{}
+	}
 
-		// Only consider Go files
-		if !strings.HasSuffix(name, ".go") {
-			return nil
-		}
-
-		// Skip test files if not included
-		if !includeTests && strings.HasSuffix(name, "_test.go") {
-			return nil
-		}
-
-		dir := filepath.Dir(path)
-		if !seen[dir] {
-			seen[dir] = true
-			dirs = append(dirs, dir)
-		}
-
-		return nil
-	})
-
-	return dirs, err
+	dirs := make([]string, 0, len(seen))
+	for dir := range seen {
+		dirs = append(dirs, dir)
+	}
+	sort.Strings(dirs)
+	return dirs
 }
 
 func analyzePackage(fset *token.FileSet, root, dir, modulePath string, opts Options) (*Package, error) {
-	// Parse the package
 	mode := parser.ParseComments
 	pkgs, err := parser.ParseDir(fset, dir, func(fi os.FileInfo) bool {
 		name := fi.Name()
@@ -124,7 +108,6 @@ func analyzePackage(fset *token.FileSet, root, dir, modulePath string, opts Opti
 		return nil, err
 	}
 
-	// Find the main package (skip _test packages)
 	var pkgName string
 	var pkgAST *ast.Package
 	for name, pkg := range pkgs {
@@ -135,9 +118,8 @@ func analyzePackage(fset *token.FileSet, root, dir, modulePath string, opts Opti
 		pkgAST = pkg
 		break
 	}
-
 	if pkgAST == nil {
-		return nil, nil // No non-test package
+		return nil, nil
 	}
 
 	relPath, err := filepath.Rel(root, dir)
@@ -146,7 +128,6 @@ func analyzePackage(fset *token.FileSet, root, dir, modulePath string, opts Opti
 	}
 	relPath = filepath.ToSlash(relPath)
 
-	// Calculate import path
 	importPath := relPath
 	if modulePath != "" {
 		if relPath == "." {
@@ -156,7 +137,6 @@ func analyzePackage(fset *token.FileSet, root, dir, modulePath string, opts Opti
 		}
 	}
 
-	// Analyze files
 	var files []File
 	var totalLines int
 	var allTypes []TypeInfo
@@ -176,65 +156,61 @@ func analyzePackage(fset *token.FileSet, root, dir, modulePath string, opts Opti
 		file := pkgAST.Files[filename]
 		basename := filepath.Base(filename)
 
-		// Count lines
-		lineCount, err := countLines(filename)
-		if err != nil {
-			continue
+		lineCount := fset.Position(file.End()).Line
+		if lineCount < 0 {
+			lineCount = 0
 		}
 		totalLines += lineCount
 
-		// Extract file-level doc
 		fileDoc := ""
 		if file.Doc != nil {
 			fileDoc = strings.TrimSpace(file.Doc.Text())
 		}
 
-		// Check for doc.go or package purpose
 		if basename == "doc.go" && file.Doc != nil {
 			purpose = extractFirstSentence(file.Doc.Text())
 		} else if purpose == "" && file.Doc != nil {
 			purpose = extractFirstSentence(file.Doc.Text())
 		}
 
-		// Extract exports
+		for _, impSpec := range file.Imports {
+			if impSpec.Path == nil {
+				continue
+			}
+			imp := strings.Trim(impSpec.Path.Value, `"`)
+			if isInternalImport(imp, modulePath) && !importsSeen[imp] {
+				importsSeen[imp] = true
+				internalImports = append(internalImports, imp)
+			}
+		}
+
 		var keyTypes []string
 		var keyFuncs []string
-
 		for _, decl := range file.Decls {
 			switch d := decl.(type) {
 			case *ast.GenDecl:
 				for _, spec := range d.Specs {
-					switch s := spec.(type) {
-					case *ast.TypeSpec:
-						if s.Name.IsExported() {
-							kind := "type"
-							switch s.Type.(type) {
-							case *ast.StructType:
-								kind = "struct"
-							case *ast.InterfaceType:
-								kind = "interface"
-							}
-							comment := ""
-							if d.Doc != nil {
-								comment = extractFirstSentence(d.Doc.Text())
-							}
-							allTypes = append(allTypes, TypeInfo{
-								Name:    s.Name.Name,
-								Kind:    kind,
-								Comment: comment,
-							})
-							keyTypes = append(keyTypes, s.Name.Name)
-						}
-					case *ast.ImportSpec:
-						if s.Path != nil {
-							imp := strings.Trim(s.Path.Value, `"`)
-							// Track internal imports
-							if isInternalImport(imp, modulePath) && !importsSeen[imp] {
-								importsSeen[imp] = true
-								internalImports = append(internalImports, imp)
-							}
-						}
+					t, ok := spec.(*ast.TypeSpec)
+					if !ok || !t.Name.IsExported() {
+						continue
 					}
+					kind := "type"
+					switch t.Type.(type) {
+					case *ast.StructType:
+						kind = "struct"
+					case *ast.InterfaceType:
+						kind = "interface"
+					}
+					comment := ""
+					if d.Doc != nil {
+						comment = extractFirstSentence(d.Doc.Text())
+					}
+					allTypes = append(allTypes, TypeInfo{
+						Name:    t.Name.Name,
+						Kind:    kind,
+						Comment: comment,
+					})
+					keyTypes = append(keyTypes, t.Name.Name)
 				}
 			case *ast.FuncDecl:
 				if d.Name.IsExported() && d.Recv == nil {
@@ -243,16 +219,14 @@ func analyzePackage(fset *token.FileSet, root, dir, modulePath string, opts Opti
 			}
 		}
 
-		f := File{
+		files = append(files, File{
 			Name:      basename,
 			LineCount: lineCount,
 			Purpose:   extractFirstSentence(fileDoc),
 			KeyTypes:  keyTypes,
 			KeyFuncs:  keyFuncs,
-		}
-		files = append(files, f)
+		})
 
-		// Determine entry point heuristic
 		score := scoreEntryPoint(basename, pkgName, keyTypes, keyFuncs)
 		if score > entryScore {
 			entryScore = score
@@ -260,12 +234,10 @@ func analyzePackage(fset *token.FileSet, root, dir, modulePath string, opts Opti
 		}
 	}
 
-	// Sort files by name
 	sort.Slice(files, func(i, j int) bool {
 		return files[i].Name < files[j].Name
 	})
 
-	// Only include file details for large packages
 	var detailedFiles []File
 	if len(files) >= opts.LargePackageFiles {
 		detailedFiles = files
@@ -302,28 +274,12 @@ func findModulePath(root string) string {
 	return ""
 }
 
-func countLines(filename string) (int, error) {
-	f, err := os.Open(filename)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-
-	count := 0
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		count++
-	}
-	return count, scanner.Err()
-}
-
 func extractFirstSentence(text string) string {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return ""
 	}
 
-	// Find first sentence ending
 	for i, r := range text {
 		if r == '.' || r == '\n' {
 			s := strings.TrimSpace(text[:i+1])
@@ -334,7 +290,6 @@ func extractFirstSentence(text string) string {
 		}
 	}
 
-	// No period found, return up to 100 chars
 	if len(text) > 100 {
 		return text[:100] + "..."
 	}
@@ -352,24 +307,17 @@ func scoreEntryPoint(filename, pkgName string, types, funcs []string) int {
 	score := 0
 	base := strings.TrimSuffix(filename, ".go")
 
-	// Exact package name match
 	if base == pkgName {
 		score += 100
 	}
-
-	// Common entry point names
 	if base == "main" || base == "server" || base == "client" {
 		score += 50
 	}
-
-	// Has main type matching package
 	for _, t := range types {
 		if strings.EqualFold(t, pkgName) {
 			score += 30
 		}
 	}
-
-	// Has New function
 	for _, f := range funcs {
 		if strings.HasPrefix(f, "New") {
 			score += 20
@@ -379,98 +327,131 @@ func scoreEntryPoint(filename, pkgName string, types, funcs []string) int {
 	return score
 }
 
-func buildConcerns(root string, defs []ConcernDef, exampleLimit int) ([]Concern, error) {
+func buildConcerns(idx *FileIndex, defs []ConcernDef, exampleLimit int) ([]Concern, error) {
 	var concerns []Concern
 
 	for _, def := range defs {
-		uniqueFiles := make(map[string]struct{})
+		matchers := make([]concernMatcher, 0, len(def.Patterns))
 		for _, pattern := range def.Patterns {
-			matches, err := matchPattern(root, pattern)
+			matcher, err := compileConcernPattern(pattern)
 			if err != nil {
 				continue
 			}
-			for _, m := range matches {
-				rel, err := filepath.Rel(root, m)
-				if err != nil {
-					rel = m
+			matchers = append(matchers, matcher)
+		}
+		if len(matchers) == 0 {
+			continue
+		}
+
+		uniqueFiles := make(map[string]struct{})
+		for _, rec := range idx.Files {
+			for _, matcher := range matchers {
+				if matcher.matches(rec.RelPath) {
+					uniqueFiles[rec.RelPath] = struct{}{}
+					break
 				}
-				uniqueFiles[filepath.ToSlash(rel)] = struct{}{}
 			}
 		}
 
 		totalFiles := len(uniqueFiles)
-		if totalFiles > 0 {
-			var examples []string
-			if exampleLimit > 0 {
-				all := make([]string, 0, totalFiles)
-				for f := range uniqueFiles {
-					all = append(all, f)
-				}
-				sort.Strings(all)
-				if len(all) > exampleLimit {
-					all = all[:exampleLimit]
-				}
-				examples = all
-			}
-
-			concerns = append(concerns, Concern{
-				Name:       def.Name,
-				Patterns:   def.Patterns,
-				Files:      examples,
-				TotalFiles: totalFiles,
-			})
+		if totalFiles == 0 {
+			continue
 		}
+
+		var examples []string
+		if exampleLimit > 0 {
+			all := make([]string, 0, totalFiles)
+			for f := range uniqueFiles {
+				all = append(all, f)
+			}
+			sort.Strings(all)
+			if len(all) > exampleLimit {
+				all = all[:exampleLimit]
+			}
+			examples = all
+		}
+
+		concerns = append(concerns, Concern{
+			Name:       def.Name,
+			Patterns:   def.Patterns,
+			Files:      examples,
+			TotalFiles: totalFiles,
+		})
 	}
 
 	return concerns, nil
 }
 
-func matchPattern(root, pattern string) ([]string, error) {
-	// Handle ** glob patterns
-	if strings.Contains(pattern, "**") {
-		return matchDoubleGlob(root, pattern)
+type concernMatcher struct {
+	pattern   string
+	hasDouble bool
+	prefix    string
+	suffix    string
+}
+
+func compileConcernPattern(pattern string) (concernMatcher, error) {
+	normalized := filepath.ToSlash(pattern)
+	if !strings.Contains(normalized, "**") {
+		return concernMatcher{pattern: normalized}, nil
 	}
-	return filepath.Glob(filepath.Join(root, pattern))
+
+	parts := strings.Split(normalized, "**")
+	if len(parts) != 2 {
+		return concernMatcher{}, fmt.Errorf("unsupported pattern: %s", pattern)
+	}
+
+	return concernMatcher{
+		pattern:   normalized,
+		hasDouble: true,
+		prefix:    strings.TrimSuffix(parts[0], "/"),
+		suffix:    strings.TrimPrefix(parts[1], "/"),
+	}, nil
+}
+
+func (m concernMatcher) matches(relPath string) bool {
+	relPath = filepath.ToSlash(relPath)
+	if m.hasDouble {
+		if m.prefix != "" && relPath != m.prefix && !strings.HasPrefix(relPath, m.prefix+"/") {
+			return false
+		}
+		if m.suffix == "" {
+			return true
+		}
+		matched, err := path.Match(m.suffix, path.Base(relPath))
+		return err == nil && matched
+	}
+
+	matched, err := path.Match(m.pattern, relPath)
+	return err == nil && matched
+}
+
+func matchPattern(root, pattern string) ([]string, error) {
+	idx, err := BuildFileIndex(context.Background(), root)
+	if err != nil {
+		return nil, err
+	}
+
+	matcher, err := compileConcernPattern(pattern)
+	if err != nil {
+		return nil, err
+	}
+
+	var matches []string
+	for _, rec := range idx.Files {
+		if matcher.matches(rec.RelPath) {
+			matches = append(matches, rec.AbsPath)
+		}
+	}
+	return matches, nil
 }
 
 func matchDoubleGlob(root, pattern string) ([]string, error) {
-	var matches []string
-
-	// Split on **
-	parts := strings.Split(pattern, "**")
-	if len(parts) != 2 {
+	matcher, err := compileConcernPattern(pattern)
+	if err != nil {
+		return nil, err
+	}
+	if !matcher.hasDouble {
 		return nil, fmt.Errorf("unsupported pattern: %s", pattern)
 	}
-
-	prefix := strings.TrimSuffix(parts[0], "/")
-	suffix := strings.TrimPrefix(parts[1], "/")
-
-	startDir := root
-	if prefix != "" {
-		startDir = filepath.Join(root, prefix)
-	}
-
-	err := filepath.Walk(startDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil // Skip errors
-		}
-		if info.IsDir() {
-			if strings.HasPrefix(info.Name(), ".") || info.Name() == "vendor" || info.Name() == "testdata" || info.Name() == "workspace" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		// Check if filename matches suffix pattern
-		matched, err := filepath.Match(suffix, info.Name())
-		if err != nil {
-			return nil
-		}
-		if matched {
-			matches = append(matches, path)
-		}
-		return nil
-	})
-
-	return matches, err
+	return matchPattern(root, pattern)
 }

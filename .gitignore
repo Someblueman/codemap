@@ -8,3 +8,9 @@
 
 # OS files
 .DS_Store
+
+# Codemap local cache
+.codemap.state.json
+
+# Perf raw outputs
+perf/history/*.txt

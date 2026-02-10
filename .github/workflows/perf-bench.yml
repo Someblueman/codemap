@@ -1,0 +1,56 @@
+name: Codemap Performance Benchmarks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.mod
+
+      - name: Run Unit Tests
+        run: go test ./...
+
+      - name: Run Benchmarks and Record History
+        env:
+          BENCH_PATTERN: "^BenchmarkCodemap"
+          BENCH_TIME: "250ms"
+          BENCH_COUNT: "1"
+        run: ./scripts/perf-record.sh
+
+      - name: Render Benchmark Summary
+        run: |
+          {
+            echo "## Codemap Benchmark Summary"
+            echo
+            echo '```text'
+            ./scripts/perf-report.sh
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Benchmark Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: codemap-benchmarks-${{ github.run_id }}
+          path: |
+            perf/history.csv
+            perf/history/*.txt
+          if-no-files-found: error

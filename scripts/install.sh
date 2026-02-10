@@ -72,3 +72,26 @@ ensure_codemap_block "${target_root}/CLAUDE.md"
 (cd "${target_root}" && git add AGENTS.md CLAUDE.md 2>/dev/null || true)
 
 echo "Updated AGENTS.md/CLAUDE.md with CODEMAP.paths guidance (idempotent block)."
+
+ensure_gitignore_entry() {
+  local file_path="$1"
+  local entry="$2"
+
+  if [[ ! -f "${file_path}" ]]; then
+    touch "${file_path}"
+  fi
+
+  if ! grep -Fxq "${entry}" "${file_path}"; then
+    {
+      echo ""
+      echo "# codemap local cache"
+      echo "${entry}"
+    } >>"${file_path}"
+  fi
+}
+
+ensure_gitignore_entry "${target_root}/.gitignore" ".codemap.state.json"
+
+(cd "${target_root}" && git add .gitignore 2>/dev/null || true)
+
+echo "Updated .gitignore with .codemap.state.json ignore rule."
