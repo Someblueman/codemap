@@ -18,5 +18,17 @@ if ! command -v codemap >/dev/null 2>&1; then
   exit 0
 fi
 
-(cd "${root}" && codemap)
-(cd "${root}" && git add CODEMAP.md CODEMAP.paths)
+stage_if_not_ignored() {
+  local path="$1"
+  if git check-ignore -q "${path}"; then
+    return 0
+  fi
+  git add "${path}" 2>/dev/null || true
+}
+
+(
+  cd "${root}"
+  codemap
+  stage_if_not_ignored CODEMAP.md
+  stage_if_not_ignored CODEMAP.paths
+)
