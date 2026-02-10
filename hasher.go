@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	codemapStateVersion    = 2
+	codemapStateVersion    = 3
 	analysisCacheVersionV2 = 2
 )
 
@@ -28,6 +28,12 @@ type StateEntry struct {
 	Size            int64  `json:"size"`
 	ModTimeUnixNano int64  `json:"modTimeUnixNano"`
 	ContentHash     string `json:"contentHash"`
+}
+
+// DirStateEntry stores per-directory metadata for fast stale checks.
+type DirStateEntry struct {
+	RelPath         string `json:"relPath"`
+	ModTimeUnixNano int64  `json:"modTimeUnixNano"`
 }
 
 // CachedPackage stores package-level analysis output for incremental rebuilds.
@@ -49,10 +55,12 @@ type AnalysisCache struct {
 
 // CodemapState stores local cache metadata for staleness checks.
 type CodemapState struct {
-	Version       int            `json:"version"`
-	AggregateHash string         `json:"aggregateHash"`
-	Entries       []StateEntry   `json:"entries"`
-	Analysis      *AnalysisCache `json:"analysis,omitempty"`
+	Version       int             `json:"version"`
+	AggregateHash string          `json:"aggregateHash"`
+	RootEntries   []string        `json:"rootEntries,omitempty"`
+	Dirs          []DirStateEntry `json:"dirs,omitempty"`
+	Entries       []StateEntry    `json:"entries"`
+	Analysis      *AnalysisCache  `json:"analysis,omitempty"`
 }
 
 // ComputeHash computes a deterministic hash of all Go files in the project.
@@ -71,11 +79,17 @@ func ComputeHash(ctx context.Context, root string) (string, error) {
 
 func computeAggregateHash(ctx context.Context, idx *FileIndex, prev *CodemapState) (string, *CodemapState, error) {
 	if aggregate, ok := aggregateHashFromState(idx, prev); ok {
+		rootEntries := make([]string, len(prev.RootEntries))
+		copy(rootEntries, prev.RootEntries)
+		dirs := make([]DirStateEntry, len(prev.Dirs))
+		copy(dirs, prev.Dirs)
 		entries := make([]StateEntry, len(prev.Entries))
 		copy(entries, prev.Entries)
 		return aggregate, &CodemapState{
 			Version:       codemapStateVersion,
 			AggregateHash: aggregate,
+			RootEntries:   rootEntries,
+			Dirs:          dirs,
 			Entries:       entries,
 		}, nil
 	}
@@ -128,6 +142,8 @@ func computeAggregateHash(ctx context.Context, idx *FileIndex, prev *CodemapStat
 	next := &CodemapState{
 		Version:       codemapStateVersion,
 		AggregateHash: aggregate,
+		RootEntries:   rootEntriesFromIndex(idx),
+		Dirs:          dirStateFromIndex(idx),
 		Entries:       entries,
 	}
 	return aggregate, next, nil
@@ -178,6 +194,9 @@ func aggregateHashFromState(idx *FileIndex, prev *CodemapState) (string, bool) {
 	if prev == nil || prev.Version != codemapStateVersion || prev.AggregateHash == "" {
 		return "", false
 	}
+	if len(prev.Dirs) == 0 {
+		return "", false
+	}
 	if len(idx.Files) != len(prev.Entries) {
 		return "", false
 	}
@@ -194,6 +213,159 @@ func aggregateHashFromState(idx *FileIndex, prev *CodemapState) (string, bool) {
 	}
 
 	return prev.AggregateHash, true
+}
+
+func dirStateFromIndex(idx *FileIndex) []DirStateEntry {
+	if idx == nil || len(idx.Dirs) == 0 {
+		return nil
+	}
+	dirs := make([]DirStateEntry, len(idx.Dirs))
+	n := 0
+	for _, rec := range idx.Dirs {
+		if rec.RelPath == "." {
+			continue
+		}
+		dirs[n] = DirStateEntry{
+			RelPath:         rec.RelPath,
+			ModTimeUnixNano: rec.ModTimeUnixNano,
+		}
+		n++
+	}
+	dirs = dirs[:n]
+	return dirs
+}
+
+func rootEntriesFromIndex(idx *FileIndex) []string {
+	if idx == nil || len(idx.RootEntries) == 0 {
+		return nil
+	}
+	entries := make([]string, len(idx.RootEntries))
+	copy(entries, idx.RootEntries)
+	return entries
+}
+
+func aggregateHashFromFilesystemState(ctx context.Context, absRoot string, prev *CodemapState, ignoredRootEntries map[string]struct{}) (string, bool, error) {
+	if absRoot == "" {
+		return "", false, errors.New("missing root")
+	}
+	if prev == nil || prev.Version != codemapStateVersion || prev.AggregateHash == "" {
+		return "", false, nil
+	}
+	if len(prev.RootEntries) == 0 {
+		return "", false, nil
+	}
+
+	currentRootEntries, err := os.ReadDir(absRoot)
+	if err != nil {
+		return "", false, err
+	}
+	expectedRootEntries := filterRootEntries(prev.RootEntries, ignoredRootEntries)
+	actualRootEntries := make([]string, 0, len(currentRootEntries))
+	for _, entry := range currentRootEntries {
+		name := entry.Name()
+		if _, ignored := ignoredRootEntries[name]; ignored {
+			continue
+		}
+		actualRootEntries = append(actualRootEntries, name)
+	}
+	if len(actualRootEntries) != len(expectedRootEntries) {
+		return "", false, nil
+	}
+	for i := range actualRootEntries {
+		if actualRootEntries[i] != expectedRootEntries[i] {
+			return "", false, nil
+		}
+	}
+
+	for _, dir := range prev.Dirs {
+		select {
+		case <-ctx.Done():
+			return "", false, ctx.Err()
+		default:
+		}
+
+		absDir := absRoot
+		if dir.RelPath != "." {
+			absDir = filepath.Join(absRoot, filepath.FromSlash(dir.RelPath))
+		}
+		info, err := os.Stat(absDir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return "", false, nil
+			}
+			return "", false, err
+		}
+		if !info.IsDir() || info.ModTime().UnixNano() != dir.ModTimeUnixNano {
+			return "", false, nil
+		}
+	}
+
+	for _, entry := range prev.Entries {
+		select {
+		case <-ctx.Done():
+			return "", false, ctx.Err()
+		default:
+		}
+
+		absPath := filepath.Join(absRoot, filepath.FromSlash(entry.RelPath))
+		info, err := os.Stat(absPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return "", false, nil
+			}
+			return "", false, err
+		}
+		if info.IsDir() {
+			return "", false, nil
+		}
+		if info.Size() != entry.Size || info.ModTime().UnixNano() != entry.ModTimeUnixNano {
+			return "", false, nil
+		}
+		if !strings.HasSuffix(entry.RelPath, ".go") || entry.ContentHash == "" {
+			return "", false, nil
+		}
+	}
+
+	return prev.AggregateHash, true, nil
+}
+
+func filterRootEntries(entries []string, ignored map[string]struct{}) []string {
+	if len(entries) == 0 {
+		return nil
+	}
+	filtered := make([]string, 0, len(entries))
+	for _, name := range entries {
+		if _, isIgnored := ignored[name]; isIgnored {
+			continue
+		}
+		filtered = append(filtered, name)
+	}
+	return filtered
+}
+
+func ignoredRootEntryNames(root string, opts Options) map[string]struct{} {
+	ignored := make(map[string]struct{}, 4)
+	maybeAdd := func(path string) {
+		if path == "" {
+			return
+		}
+		abs := path
+		if !filepath.IsAbs(abs) {
+			abs = filepath.Join(root, abs)
+		}
+		if filepath.Dir(abs) != root {
+			return
+		}
+		ignored[filepath.Base(abs)] = struct{}{}
+	}
+
+	maybeAdd(opts.OutputPath)
+	if !opts.DisablePaths {
+		maybeAdd(opts.PathsOutputPath)
+	}
+	maybeAdd(resolveStatePath(root, opts))
+	maybeAdd(resolveAnalysisStatePath(root, opts))
+	return ignored
 }
 
 func sortedStateEntries(prev *CodemapState) []StateEntry {
@@ -353,6 +525,10 @@ func readState(path string) (*CodemapState, error) {
 		return nil, nil
 	}
 
+	sort.Strings(state.RootEntries)
+	sort.Slice(state.Dirs, func(i, j int) bool {
+		return state.Dirs[i].RelPath < state.Dirs[j].RelPath
+	})
 	sort.Slice(state.Entries, func(i, j int) bool {
 		return state.Entries[i].RelPath < state.Entries[j].RelPath
 	})
@@ -559,18 +735,23 @@ func IsStale(ctx context.Context, opts Options) (bool, error) {
 		}
 	}
 
-	idx, err := BuildFileIndex(ctx, root)
-	if err != nil {
-		return false, fmt.Errorf("build file index: %w", err)
-	}
-
 	state, err := readState(resolveStatePath(root, opts))
 	if err != nil {
 		return false, fmt.Errorf("read state: %w", err)
 	}
-	currentHash, err := computeAggregateHashOnly(ctx, idx, state)
+	currentHash, matchedFromState, err := aggregateHashFromFilesystemState(ctx, root, state, ignoredRootEntryNames(root, opts))
 	if err != nil {
-		return false, fmt.Errorf("compute hash: %w", err)
+		return false, fmt.Errorf("verify state: %w", err)
+	}
+	if !matchedFromState {
+		idx, err := BuildFileIndex(ctx, root)
+		if err != nil {
+			return false, fmt.Errorf("build file index: %w", err)
+		}
+		currentHash, err = computeAggregateHashOnly(ctx, idx, state)
+		if err != nil {
+			return false, fmt.Errorf("compute hash: %w", err)
+		}
 	}
 
 	if existingHash != currentHash {

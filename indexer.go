@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -19,10 +20,18 @@ type FileRecord struct {
 	IsTest          bool
 }
 
+// DirRecord describes a discovered directory in the project tree.
+type DirRecord struct {
+	RelPath         string
+	ModTimeUnixNano int64
+}
+
 // FileIndex is a deterministic snapshot of files under a project root.
 type FileIndex struct {
-	Root  string
-	Files []FileRecord
+	Root        string
+	RootEntries []string
+	Dirs        []DirRecord
+	Files       []FileRecord
 }
 
 // BuildFileIndex walks root once and captures all files needed by codemap.
@@ -44,10 +53,41 @@ func BuildFileIndex(ctx context.Context, root string) (*FileIndex, error) {
 		default:
 		}
 
+		if path != absRoot && filepath.Dir(path) == absRoot {
+			idx.RootEntries = append(idx.RootEntries, d.Name())
+		}
+
 		if d.IsDir() {
 			if path != absRoot && isExcludedDir(d.Name()) {
 				return filepath.SkipDir
 			}
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+
+			relPath := "."
+			if path != absRoot {
+				relPath = path
+				if strings.HasPrefix(path, rootPrefix) {
+					relPath = path[len(rootPrefix):]
+					if os.PathSeparator != '/' {
+						relPath = filepath.ToSlash(relPath)
+					}
+				} else {
+					relPath, err = filepath.Rel(absRoot, path)
+					if err != nil {
+						relPath = filepath.ToSlash(path)
+					} else {
+						relPath = filepath.ToSlash(relPath)
+					}
+				}
+			}
+
+			idx.Dirs = append(idx.Dirs, DirRecord{
+				RelPath:         relPath,
+				ModTimeUnixNano: info.ModTime().UnixNano(),
+			})
 			return nil
 		}
 
@@ -90,6 +130,7 @@ func BuildFileIndex(ctx context.Context, root string) (*FileIndex, error) {
 	if err != nil {
 		return nil, fmt.Errorf("walk directory: %w", err)
 	}
+	sort.Strings(idx.RootEntries)
 
 	return idx, nil
 }

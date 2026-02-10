@@ -388,3 +388,80 @@ func TestParseHashLine(t *testing.T) {
 		}
 	}
 }
+
+func TestAggregateHashFromFilesystemState(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "a.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "b.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	idx, err := BuildFileIndex(ctx, tmpDir)
+	if err != nil {
+		t.Fatalf("BuildFileIndex failed: %v", err)
+	}
+	hash, state, err := computeAggregateHash(ctx, idx, nil)
+	if err != nil {
+		t.Fatalf("computeAggregateHash failed: %v", err)
+	}
+
+	got, ok, err := aggregateHashFromFilesystemState(ctx, tmpDir, state, nil)
+	if err != nil {
+		t.Fatalf("aggregateHashFromFilesystemState failed: %v", err)
+	}
+	if !ok || got != hash {
+		t.Fatalf("expected fast-path match with same hash, got ok=%v hash=%s", ok, got)
+	}
+
+	time.Sleep(2 * time.Millisecond)
+	if err := os.WriteFile(filepath.Join(tmpDir, "c.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, ok, err = aggregateHashFromFilesystemState(ctx, tmpDir, state, nil)
+	if err != nil {
+		t.Fatalf("aggregateHashFromFilesystemState failed: %v", err)
+	}
+	if ok {
+		t.Fatal("expected fast-path mismatch after adding file")
+	}
+}
+
+func TestAggregateHashFromFilesystemStateDetectsGoFileInPreviouslyNonGoDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, "docs"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "docs", "readme.txt"), []byte("hi"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "main.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	idx, err := BuildFileIndex(ctx, tmpDir)
+	if err != nil {
+		t.Fatalf("BuildFileIndex failed: %v", err)
+	}
+	_, state, err := computeAggregateHash(ctx, idx, nil)
+	if err != nil {
+		t.Fatalf("computeAggregateHash failed: %v", err)
+	}
+
+	time.Sleep(2 * time.Millisecond)
+	if err := os.WriteFile(filepath.Join(tmpDir, "docs", "new.go"), []byte("package docs\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, ok, err := aggregateHashFromFilesystemState(ctx, tmpDir, state, nil)
+	if err != nil {
+		t.Fatalf("aggregateHashFromFilesystemState failed: %v", err)
+	}
+	if ok {
+		t.Fatal("expected mismatch after adding go file in previously non-go directory")
+	}
+}
