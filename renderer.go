@@ -100,46 +100,118 @@ func EnsureUpToDate(ctx context.Context, opts Options) (*Codemap, bool, error) {
 		opts.PathsOutputPath = pathsRenderer.DefaultPath()
 	}
 
-	idx, err := BuildFileIndex(ctx, root)
-	if err != nil {
-		return nil, false, fmt.Errorf("build file index: %w", err)
-	}
-
 	statePath := resolveStatePath(root, opts)
 	state, err := readState(statePath)
 	if err != nil {
 		return nil, false, fmt.Errorf("read state: %w", err)
 	}
-	currentHash, nextState, err := computeAggregateHash(ctx, idx, state)
-	if err != nil {
-		return nil, false, fmt.Errorf("compute hash: %w", err)
-	}
 
 	outputPath := filepath.Join(root, opts.OutputPath)
+	pathsPath := filepath.Join(root, opts.PathsOutputPath)
+	ignoredRootEntries := ignoredRootEntryNames(root, opts)
+
 	existingHash, err := ReadExistingHash(outputPath)
 	if err != nil {
 		return nil, false, fmt.Errorf("read existing hash: %w", err)
 	}
-	if existingHash != "" && existingHash == currentHash {
-		if opts.DisablePaths {
-			return nil, false, nil
-		}
-
-		pathsPath := filepath.Join(root, opts.PathsOutputPath)
-		existingPathsHash, err := ReadExistingHash(pathsPath)
+	var existingPathsHash string
+	if !opts.DisablePaths {
+		existingPathsHash, err = ReadExistingHash(pathsPath)
 		if err != nil {
 			return nil, false, fmt.Errorf("read existing paths hash: %w", err)
 		}
-		if existingPathsHash != "" && existingPathsHash == currentHash {
-			return nil, false, nil
+	}
+
+	idx, unchangedFromState, err := buildFileIndexFromState(ctx, root, state, ignoredRootEntries)
+	if err != nil {
+		return nil, false, fmt.Errorf("build file index from state: %w", err)
+	}
+	if idx != nil {
+		currentHash := state.AggregateHash
+		if !unchangedFromState {
+			currentHash, err = computeAggregateHashOnly(ctx, idx, state)
+			if err != nil {
+				return nil, false, fmt.Errorf("compute hash: %w", err)
+			}
+		}
+		if existingHash != "" && existingHash == currentHash {
+			if opts.DisablePaths {
+				return nil, false, nil
+			}
+			if existingPathsHash != "" && existingPathsHash == currentHash {
+				return nil, false, nil
+			}
+		}
+
+		currentHash, nextState, err := computeAggregateHash(ctx, idx, state)
+		if err != nil {
+			return nil, false, fmt.Errorf("compute hash: %w", err)
+		}
+		if existingHash != "" && existingHash == currentHash {
+			if opts.DisablePaths || (existingPathsHash != "" && existingPathsHash == currentHash) {
+				return nil, false, nil
+			}
+		}
+		return generateOutputs(ctx, root, opts, outputPath, pathsPath, statePath, state, nextState, currentHash, idx, markdownRenderer, pathsRenderer)
+	}
+
+	// Fallback warm fast-path: if filesystem metadata still matches cached state, avoid full index/hash work.
+	currentHash, matchedFromState, err := aggregateHashFromFilesystemState(ctx, root, state, ignoredRootEntries)
+	if err != nil {
+		return nil, false, fmt.Errorf("verify state: %w", err)
+	}
+	if matchedFromState {
+		if existingHash != "" && existingHash == currentHash {
+			if opts.DisablePaths || (existingPathsHash != "" && existingPathsHash == currentHash) {
+				return nil, false, nil
+			}
 		}
 	}
 
+	idx, err = BuildFileIndex(ctx, root)
+	if err != nil {
+		return nil, false, fmt.Errorf("build file index: %w", err)
+	}
+	currentHash, nextState, err := computeAggregateHash(ctx, idx, state)
+	if err != nil {
+		return nil, false, fmt.Errorf("compute hash: %w", err)
+	}
+	if existingHash != "" && existingHash == currentHash {
+		if opts.DisablePaths || (existingPathsHash != "" && existingPathsHash == currentHash) {
+			return nil, false, nil
+		}
+	}
+	return generateOutputs(ctx, root, opts, outputPath, pathsPath, statePath, state, nextState, currentHash, idx, markdownRenderer, pathsRenderer)
+}
+
+func generateOutputs(
+	ctx context.Context,
+	root string,
+	opts Options,
+	outputPath string,
+	pathsPath string,
+	statePath string,
+	state *CodemapState,
+	nextState *CodemapState,
+	currentHash string,
+	idx *FileIndex,
+	markdownRenderer MarkdownRenderer,
+	pathsRenderer PathsRenderer,
+) (*Codemap, bool, error) {
+	analysisPath := resolveAnalysisStatePath(root, opts)
+	analysisCache, err := readAnalysisCache(analysisPath)
+	if err != nil {
+		return nil, false, fmt.Errorf("read analysis cache: %w", err)
+	}
+	prevState := mergeStateWithAnalysis(state, analysisCache)
+
 	analyzer := GoAnalyzer{}
 	cm, err := analyzer.Analyze(ctx, AnalysisInput{
-		Root:    root,
-		Index:   idx,
-		Options: opts,
+		Root:      root,
+		Index:     idx,
+		Options:   opts,
+		PrevState: prevState,
+		NextState: nextState,
 	})
 	if err != nil {
 		return nil, false, fmt.Errorf("analyze: %w", err)
@@ -152,13 +224,15 @@ func EnsureUpToDate(ctx context.Context, opts Options) (*Codemap, bool, error) {
 		return nil, false, err
 	}
 	if !opts.DisablePaths {
-		pathsPath := filepath.Join(root, opts.PathsOutputPath)
 		if err := writeRenderedOutput(pathsPath, pathsRenderer, cm); err != nil {
 			return nil, false, err
 		}
 	}
 	if err := writeState(statePath, nextState); err != nil {
 		return nil, false, fmt.Errorf("write state: %w", err)
+	}
+	if err := writeAnalysisCache(analysisPath, nextState.Analysis); err != nil {
+		return nil, false, fmt.Errorf("write analysis cache: %w", err)
 	}
 
 	return cm, true, nil
@@ -190,16 +264,26 @@ func Generate(ctx context.Context, opts Options) (*Codemap, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read state: %w", err)
 	}
+
+	analysisPath := resolveAnalysisStatePath(root, opts)
+	analysisCache, err := readAnalysisCache(analysisPath)
+	if err != nil {
+		return nil, fmt.Errorf("read analysis cache: %w", err)
+	}
+
 	hash, nextState, err := computeAggregateHash(ctx, idx, state)
 	if err != nil {
 		return nil, fmt.Errorf("compute hash: %w", err)
 	}
 
+	prevState := mergeStateWithAnalysis(state, analysisCache)
 	analyzer := GoAnalyzer{}
 	cm, err := analyzer.Analyze(ctx, AnalysisInput{
-		Root:    root,
-		Index:   idx,
-		Options: opts,
+		Root:      root,
+		Index:     idx,
+		Options:   opts,
+		PrevState: prevState,
+		NextState: nextState,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("analyze: %w", err)
@@ -221,8 +305,20 @@ func Generate(ctx context.Context, opts Options) (*Codemap, error) {
 	if err := writeState(statePath, nextState); err != nil {
 		return nil, fmt.Errorf("write state: %w", err)
 	}
+	if err := writeAnalysisCache(analysisPath, nextState.Analysis); err != nil {
+		return nil, fmt.Errorf("write analysis cache: %w", err)
+	}
 
 	return cm, nil
+}
+
+func mergeStateWithAnalysis(state *CodemapState, analysis *AnalysisCache) *CodemapState {
+	if state == nil || analysis == nil {
+		return state
+	}
+	copy := *state
+	copy.Analysis = analysis
+	return &copy
 }
 
 func writeRenderedOutput(outputPath string, renderer Renderer, cm *Codemap) error {
@@ -233,6 +329,7 @@ func writeRenderedOutput(outputPath string, renderer Renderer, cm *Codemap) erro
 	if err := os.WriteFile(outputPath, []byte(content), 0644); err != nil {
 		return fmt.Errorf("write %s output: %w", renderer.Name(), err)
 	}
+	cacheExistingHash(outputPath, cm.ContentHash)
 	return nil
 }
 

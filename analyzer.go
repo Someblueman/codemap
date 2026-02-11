@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -10,8 +12,10 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // Analyze walks the project and extracts package information.
@@ -29,40 +33,44 @@ func Analyze(ctx context.Context, opts Options) (*Codemap, error) {
 	})
 }
 
-func analyzeGoWithIndex(ctx context.Context, root string, idx *FileIndex, opts Options) (*Codemap, error) {
-	pkgDirs := findPackageDirsFromIndex(idx, opts.IncludeTests)
-
-	var packages []Package
-	fset := token.NewFileSet()
+func analyzeGoWithIndex(ctx context.Context, root string, idx *FileIndex, opts Options, prevState, nextState *CodemapState) (*Codemap, error) {
 	modulePath := findModulePath(root)
+	entryByRel := stateEntryByRelPath(nextState)
+	plans := buildPackagePlansFromIndex(root, idx, opts.IncludeTests, entryByRel)
+	cachedByRel := cachedPackagesByPath(prevState, opts, modulePath)
 
-	for _, dir := range pkgDirs {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-
-		pkg, err := analyzePackage(fset, root, dir, modulePath, opts)
-		if err != nil {
-			if opts.Verbose {
-				fmt.Fprintf(os.Stderr, "warning: skipping %s: %v\n", dir, err)
-			}
+	packageResults := make([]*Package, len(plans))
+	jobs := make([]analysisJob, 0, len(plans))
+	for i := range plans {
+		plan := plans[i]
+		if cached, ok := cachedByRel[plan.RelativePath]; ok && plan.Fingerprint != "" && cached.Fingerprint == plan.Fingerprint {
+			pkg := cached.Package
+			packageResults[i] = &pkg
 			continue
 		}
-		if pkg != nil {
-			packages = append(packages, *pkg)
-		}
+		jobs = append(jobs, analysisJob{
+			index: i,
+			dir:   plan.DirAbsPath,
+		})
 	}
 
-	sort.Slice(packages, func(i, j int) bool {
-		return packages[i].RelativePath < packages[j].RelativePath
-	})
+	if err := analyzePackagesParallel(ctx, root, modulePath, opts, jobs, packageResults); err != nil {
+		return nil, err
+	}
+
+	packages := make([]Package, 0, len(packageResults))
+	for i := range packageResults {
+		if packageResults[i] != nil {
+			packages = append(packages, *packageResults[i])
+		}
+	}
 
 	concerns, err := buildConcerns(idx, opts.Concerns, opts.ConcernExampleLimit)
 	if err != nil {
 		return nil, fmt.Errorf("build concerns: %w", err)
 	}
+
+	updateAnalysisCache(nextState, opts, modulePath, plans, packageResults)
 
 	return &Codemap{
 		ProjectRoot: root,
@@ -72,28 +80,16 @@ func analyzeGoWithIndex(ctx context.Context, root string, idx *FileIndex, opts O
 }
 
 func findPackageDirsFromIndex(idx *FileIndex, includeTests bool) []string {
-	seen := make(map[string]struct{})
-	for _, rec := range idx.Files {
-		if !rec.IsGo {
-			continue
-		}
-		if !includeTests && rec.IsTest {
-			continue
-		}
-		dir := filepath.Dir(rec.AbsPath)
-		seen[dir] = struct{}{}
+	plans := buildPackagePlansFromIndex("", idx, includeTests, nil)
+	dirs := make([]string, 0, len(plans))
+	for _, plan := range plans {
+		dirs = append(dirs, plan.DirAbsPath)
 	}
-
-	dirs := make([]string, 0, len(seen))
-	for dir := range seen {
-		dirs = append(dirs, dir)
-	}
-	sort.Strings(dirs)
 	return dirs
 }
 
 func analyzePackage(fset *token.FileSet, root, dir, modulePath string, opts Options) (*Package, error) {
-	mode := parser.ParseComments
+	mode := parser.ParseComments | parser.SkipObjectResolution
 	pkgs, err := parser.ParseDir(fset, dir, func(fi os.FileInfo) bool {
 		name := fi.Name()
 		if !strings.HasSuffix(name, ".go") {
@@ -108,19 +104,18 @@ func analyzePackage(fset *token.FileSet, root, dir, modulePath string, opts Opti
 		return nil, err
 	}
 
-	var pkgName string
-	var pkgAST *ast.Package
-	for name, pkg := range pkgs {
-		if strings.HasSuffix(name, "_test") {
-			continue
+	pkgNames := make([]string, 0, len(pkgs))
+	for name := range pkgs {
+		if !strings.HasSuffix(name, "_test") {
+			pkgNames = append(pkgNames, name)
 		}
-		pkgName = name
-		pkgAST = pkg
-		break
 	}
-	if pkgAST == nil {
+	if len(pkgNames) == 0 {
 		return nil, nil
 	}
+	sort.Strings(pkgNames)
+	pkgName := pkgNames[0]
+	pkgAST := pkgs[pkgName]
 
 	relPath, err := filepath.Rel(root, dir)
 	if err != nil {
@@ -137,16 +132,16 @@ func analyzePackage(fset *token.FileSet, root, dir, modulePath string, opts Opti
 		}
 	}
 
-	var files []File
+	files := make([]File, 0, len(pkgAST.Files))
 	var totalLines int
-	var allTypes []TypeInfo
-	var internalImports []string
-	importsSeen := make(map[string]bool)
+	allTypes := make([]TypeInfo, 0, len(pkgAST.Files))
+	internalImports := make([]string, 0, len(pkgAST.Files))
+	importsSeen := make(map[string]struct{}, len(pkgAST.Files))
 	var purpose string
 	entryPoint := ""
 	entryScore := -1
 
-	var filenames []string
+	filenames := make([]string, 0, len(pkgAST.Files))
 	for filename := range pkgAST.Files {
 		filenames = append(filenames, filename)
 	}
@@ -166,6 +161,7 @@ func analyzePackage(fset *token.FileSet, root, dir, modulePath string, opts Opti
 		if file.Doc != nil {
 			fileDoc = strings.TrimSpace(file.Doc.Text())
 		}
+		filePurpose := extractFirstSentence(fileDoc)
 
 		if basename == "doc.go" && file.Doc != nil {
 			purpose = extractFirstSentence(file.Doc.Text())
@@ -178,8 +174,8 @@ func analyzePackage(fset *token.FileSet, root, dir, modulePath string, opts Opti
 				continue
 			}
 			imp := strings.Trim(impSpec.Path.Value, `"`)
-			if isInternalImport(imp, modulePath) && !importsSeen[imp] {
-				importsSeen[imp] = true
+			if _, seen := importsSeen[imp]; isInternalImport(imp, modulePath) && !seen {
+				importsSeen[imp] = struct{}{}
 				internalImports = append(internalImports, imp)
 			}
 		}
@@ -222,7 +218,7 @@ func analyzePackage(fset *token.FileSet, root, dir, modulePath string, opts Opti
 		files = append(files, File{
 			Name:      basename,
 			LineCount: lineCount,
-			Purpose:   extractFirstSentence(fileDoc),
+			Purpose:   filePurpose,
 			KeyTypes:  keyTypes,
 			KeyFuncs:  keyFuncs,
 		})
@@ -233,10 +229,6 @@ func analyzePackage(fset *token.FileSet, root, dir, modulePath string, opts Opti
 			entryPoint = basename
 		}
 	}
-
-	sort.Slice(files, func(i, j int) bool {
-		return files[i].Name < files[j].Name
-	})
 
 	var detailedFiles []File
 	if len(files) >= opts.LargePackageFiles {
@@ -454,4 +446,227 @@ func matchDoubleGlob(root, pattern string) ([]string, error) {
 		return nil, fmt.Errorf("unsupported pattern: %s", pattern)
 	}
 	return matchPattern(root, pattern)
+}
+
+type packagePlan struct {
+	RelativePath string
+	DirAbsPath   string
+	FileRelPaths []string
+	Fingerprint  string
+}
+
+type analysisJob struct {
+	index int
+	dir   string
+}
+
+type analysisResult struct {
+	index int
+	dir   string
+	pkg   *Package
+	err   error
+}
+
+func stateEntryByRelPath(state *CodemapState) map[string]StateEntry {
+	if state == nil || len(state.Entries) == 0 {
+		return nil
+	}
+	entriesByRel := make(map[string]StateEntry, len(state.Entries))
+	for _, entry := range state.Entries {
+		entriesByRel[entry.RelPath] = entry
+	}
+	return entriesByRel
+}
+
+func buildPackagePlansFromIndex(root string, idx *FileIndex, includeTests bool, entriesByRel map[string]StateEntry) []packagePlan {
+	plansByRel := make(map[string]*packagePlan)
+	for _, rec := range idx.Files {
+		if !includeTests && rec.IsTest {
+			continue
+		}
+
+		relDir := filepath.ToSlash(filepath.Dir(rec.RelPath))
+		plan, ok := plansByRel[relDir]
+		if !ok {
+			absDir := filepath.Join(idx.Root, filepath.FromSlash(relDir))
+			if root != "" {
+				absDir = filepath.Join(root, filepath.FromSlash(relDir))
+			}
+			plan = &packagePlan{
+				RelativePath: relDir,
+				DirAbsPath:   absDir,
+				FileRelPaths: make([]string, 0, 4),
+			}
+			plansByRel[relDir] = plan
+		}
+		plan.FileRelPaths = append(plan.FileRelPaths, rec.RelPath)
+	}
+
+	relPaths := make([]string, 0, len(plansByRel))
+	for rel := range plansByRel {
+		relPaths = append(relPaths, rel)
+	}
+	sort.Strings(relPaths)
+
+	plans := make([]packagePlan, 0, len(relPaths))
+	for _, rel := range relPaths {
+		plan := plansByRel[rel]
+		plan.Fingerprint = packageFingerprint(plan.FileRelPaths, entriesByRel)
+		plans = append(plans, *plan)
+	}
+	return plans
+}
+
+func packageFingerprint(fileRelPaths []string, entriesByRel map[string]StateEntry) string {
+	if len(fileRelPaths) == 0 || entriesByRel == nil {
+		return ""
+	}
+
+	h := sha256.New()
+	sep := []byte{0}
+	for _, relPath := range fileRelPaths {
+		entry, ok := entriesByRel[relPath]
+		if !ok || entry.ContentHash == "" {
+			return ""
+		}
+		_, _ = h.Write([]byte(relPath))
+		_, _ = h.Write(sep)
+		_, _ = h.Write([]byte(entry.ContentHash))
+		_, _ = h.Write(sep)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func cachedPackagesByPath(prevState *CodemapState, opts Options, modulePath string) map[string]CachedPackage {
+	if prevState == nil || prevState.Analysis == nil {
+		return nil
+	}
+	cache := prevState.Analysis
+	if cache.Version != analysisCacheVersionV2 ||
+		cache.IncludeTests != opts.IncludeTests ||
+		cache.LargePackageFiles != opts.LargePackageFiles ||
+		cache.ModulePath != modulePath {
+		return nil
+	}
+
+	byRel := make(map[string]CachedPackage, len(cache.Packages))
+	for _, cachedPkg := range cache.Packages {
+		byRel[cachedPkg.RelativePath] = cachedPkg
+	}
+	return byRel
+}
+
+func analyzePackagesParallel(ctx context.Context, root, modulePath string, opts Options, jobs []analysisJob, out []*Package) error {
+	if len(jobs) == 0 {
+		return nil
+	}
+
+	workerCount := runtime.GOMAXPROCS(0)
+	if workerCount < 1 {
+		workerCount = 1
+	}
+	if workerCount > len(jobs) {
+		workerCount = len(jobs)
+	}
+
+	if workerCount == 1 {
+		for _, job := range jobs {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+			pkg, err := analyzePackage(token.NewFileSet(), root, job.dir, modulePath, opts)
+			if err != nil {
+				if opts.Verbose {
+					fmt.Fprintf(os.Stderr, "warning: skipping %s: %v\n", job.dir, err)
+				}
+				continue
+			}
+			out[job.index] = pkg
+		}
+		return nil
+	}
+
+	jobsCh := make(chan analysisJob)
+	resultsCh := make(chan analysisResult, len(jobs))
+	var wg sync.WaitGroup
+
+	worker := func() {
+		defer wg.Done()
+		for job := range jobsCh {
+			pkg, err := analyzePackage(token.NewFileSet(), root, job.dir, modulePath, opts)
+			select {
+			case resultsCh <- analysisResult{
+				index: job.index,
+				dir:   job.dir,
+				pkg:   pkg,
+				err:   err,
+			}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+
+	wg.Add(workerCount)
+	for i := 0; i < workerCount; i++ {
+		go worker()
+	}
+
+	go func() {
+		defer close(jobsCh)
+		for _, job := range jobs {
+			select {
+			case jobsCh <- job:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	for i := 0; i < len(jobs); i++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case result := <-resultsCh:
+			if result.err != nil {
+				if opts.Verbose {
+					fmt.Fprintf(os.Stderr, "warning: skipping %s: %v\n", result.dir, result.err)
+				}
+				continue
+			}
+			out[result.index] = result.pkg
+		}
+	}
+
+	wg.Wait()
+	return nil
+}
+
+func updateAnalysisCache(nextState *CodemapState, opts Options, modulePath string, plans []packagePlan, packageResults []*Package) {
+	if nextState == nil {
+		return
+	}
+
+	cachedPkgs := make([]CachedPackage, 0, len(packageResults))
+	for i := range packageResults {
+		if packageResults[i] == nil || plans[i].Fingerprint == "" {
+			continue
+		}
+		cachedPkgs = append(cachedPkgs, CachedPackage{
+			RelativePath: plans[i].RelativePath,
+			Fingerprint:  plans[i].Fingerprint,
+			FileRelPaths: append([]string(nil), plans[i].FileRelPaths...),
+			Package:      *packageResults[i],
+		})
+	}
+
+	nextState.Analysis = &AnalysisCache{
+		Version:           analysisCacheVersionV2,
+		IncludeTests:      opts.IncludeTests,
+		LargePackageFiles: opts.LargePackageFiles,
+		ModulePath:        modulePath,
+		Packages:          cachedPkgs,
+	}
 }

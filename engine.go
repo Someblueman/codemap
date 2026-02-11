@@ -7,9 +7,11 @@ import (
 
 // AnalysisInput provides shared context for analyzer implementations.
 type AnalysisInput struct {
-	Root    string
-	Index   *FileIndex
-	Options Options
+	Root      string
+	Index     *FileIndex
+	Options   Options
+	PrevState *CodemapState
+	NextState *CodemapState
 }
 
 // Analyzer builds a codemap model from a project snapshot.
@@ -31,7 +33,7 @@ func (GoAnalyzer) Analyze(ctx context.Context, in AnalysisInput) (*Codemap, erro
 	if in.Index == nil {
 		return nil, errors.New("missing file index")
 	}
-	return analyzeGoWithIndex(ctx, in.Root, in.Index, in.Options)
+	return analyzeGoWithIndex(ctx, in.Root, in.Index, in.Options, in.PrevState, in.NextState)
 }
 
 // MarkdownRenderer renders CODEMAP.md output.

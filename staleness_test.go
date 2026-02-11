@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 )
@@ -206,5 +207,261 @@ func TestBuildConcernsFromIndex(t *testing.T) {
 	}
 	if concerns[0].TotalFiles != 2 {
 		t.Fatalf("expected 2 matched files, got %d", concerns[0].TotalFiles)
+	}
+}
+
+func TestEnsureUpToDateWritesAnalysisCache(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module example.com/test\n\ngo 1.21\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(tmpDir, "internal", "foo"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(tmpDir, "internal", "bar"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "internal", "foo", "foo.go"), []byte("package foo\n\ntype Foo struct{}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "internal", "bar", "bar.go"), []byte("package bar\n\ntype Bar struct{}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := DefaultOptions()
+	opts.ProjectRoot = tmpDir
+	if _, _, err := EnsureUpToDate(context.Background(), opts); err != nil {
+		t.Fatalf("EnsureUpToDate failed: %v", err)
+	}
+
+	statePath := filepath.Join(tmpDir, opts.StatePath)
+	state, err := readState(statePath)
+	if err != nil {
+		t.Fatalf("readState failed: %v", err)
+	}
+	if state == nil {
+		t.Fatal("expected hash state")
+	}
+
+	analysisPath := resolveAnalysisStatePath(tmpDir, opts)
+	cache, err := readAnalysisCache(analysisPath)
+	if err != nil {
+		t.Fatalf("readAnalysisCache failed: %v", err)
+	}
+	if cache == nil {
+		t.Fatal("expected analysis cache")
+	}
+	if cache.Version != analysisCacheVersionV2 {
+		t.Fatalf("expected analysis cache version %d, got %d", analysisCacheVersionV2, cache.Version)
+	}
+	if len(cache.Packages) != 2 {
+		t.Fatalf("expected 2 cached packages, got %d", len(cache.Packages))
+	}
+
+	paths := []string{
+		cache.Packages[0].RelativePath,
+		cache.Packages[1].RelativePath,
+	}
+	sort.Strings(paths)
+	if paths[0] != "internal/bar" || paths[1] != "internal/foo" {
+		t.Fatalf("unexpected cached package paths: %v", paths)
+	}
+	for _, pkg := range cache.Packages {
+		if pkg.Fingerprint == "" {
+			t.Fatalf("expected non-empty fingerprint for %s", pkg.RelativePath)
+		}
+	}
+}
+
+func TestEnsureUpToDateIncrementalCacheHandlesDelete(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module example.com/test\n\ngo 1.21\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(tmpDir, "internal", "a"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(tmpDir, "internal", "b"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "internal", "a", "a.go"), []byte("package a\n\nvar A = 1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "internal", "b", "b.go"), []byte("package b\n\nvar B = 1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := DefaultOptions()
+	opts.ProjectRoot = tmpDir
+	if _, _, err := EnsureUpToDate(context.Background(), opts); err != nil {
+		t.Fatalf("EnsureUpToDate initial failed: %v", err)
+	}
+
+	if err := os.Remove(filepath.Join(tmpDir, "internal", "b", "b.go")); err != nil {
+		t.Fatal(err)
+	}
+	if _, generated, err := EnsureUpToDate(context.Background(), opts); err != nil {
+		t.Fatalf("EnsureUpToDate after delete failed: %v", err)
+	} else if !generated {
+		t.Fatal("expected regeneration after delete")
+	}
+
+	analysisPath := resolveAnalysisStatePath(tmpDir, opts)
+	cache, err := readAnalysisCache(analysisPath)
+	if err != nil {
+		t.Fatalf("readAnalysisCache failed: %v", err)
+	}
+	if cache == nil {
+		t.Fatal("expected analysis cache")
+	}
+	for _, pkg := range cache.Packages {
+		if pkg.RelativePath == "internal/b" {
+			t.Fatalf("did not expect deleted package in cache: %s", pkg.RelativePath)
+		}
+	}
+}
+
+func TestEnsureUpToDateInvalidatesIncompatibleAnalysisCache(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module example.com/test\n\ngo 1.21\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "main.go"), []byte("package main\n\nvar X = 1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := DefaultOptions()
+	opts.ProjectRoot = tmpDir
+	if _, _, err := EnsureUpToDate(context.Background(), opts); err != nil {
+		t.Fatalf("EnsureUpToDate initial failed: %v", err)
+	}
+
+	analysisPath := resolveAnalysisStatePath(tmpDir, opts)
+	cache, err := readAnalysisCache(analysisPath)
+	if err != nil {
+		t.Fatalf("readAnalysisCache failed: %v", err)
+	}
+	if cache == nil {
+		t.Fatal("expected analysis cache")
+	}
+	cache.Version = 1
+	if err := writeAnalysisCache(analysisPath, cache); err != nil {
+		t.Fatalf("writeAnalysisCache failed: %v", err)
+	}
+
+	time.Sleep(2 * time.Millisecond)
+	if err := os.WriteFile(filepath.Join(tmpDir, "main.go"), []byte("package main\n\nvar X = 2\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, generated, err := EnsureUpToDate(context.Background(), opts); err != nil {
+		t.Fatalf("EnsureUpToDate failed after invalid cache: %v", err)
+	} else if !generated {
+		t.Fatal("expected regeneration after source change")
+	}
+
+	after, err := readAnalysisCache(analysisPath)
+	if err != nil {
+		t.Fatalf("readAnalysisCache failed: %v", err)
+	}
+	if after == nil || after.Version != analysisCacheVersionV2 {
+		t.Fatalf("expected analysis cache version %d after rebuild", analysisCacheVersionV2)
+	}
+}
+
+func TestParseHashLine(t *testing.T) {
+	tests := []struct {
+		line string
+		want string
+	}{
+		{line: "<!-- codemap-hash: deadbeef -->", want: "deadbeef"},
+		{line: "# codemap-hash: 0123abcd", want: "0123abcd"},
+		{line: "codemap-hash: 00ff", want: "00ff"},
+		{line: "# codemap-hash: INVALID", want: ""},
+		{line: "random", want: ""},
+	}
+
+	for _, tt := range tests {
+		got := parseHashLine(tt.line)
+		if got != tt.want {
+			t.Fatalf("parseHashLine(%q) = %q, want %q", tt.line, got, tt.want)
+		}
+	}
+}
+
+func TestAggregateHashFromFilesystemState(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "a.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "b.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	idx, err := BuildFileIndex(ctx, tmpDir)
+	if err != nil {
+		t.Fatalf("BuildFileIndex failed: %v", err)
+	}
+	hash, state, err := computeAggregateHash(ctx, idx, nil)
+	if err != nil {
+		t.Fatalf("computeAggregateHash failed: %v", err)
+	}
+
+	got, ok, err := aggregateHashFromFilesystemState(ctx, tmpDir, state, nil)
+	if err != nil {
+		t.Fatalf("aggregateHashFromFilesystemState failed: %v", err)
+	}
+	if !ok || got != hash {
+		t.Fatalf("expected fast-path match with same hash, got ok=%v hash=%s", ok, got)
+	}
+
+	time.Sleep(2 * time.Millisecond)
+	if err := os.WriteFile(filepath.Join(tmpDir, "c.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, ok, err = aggregateHashFromFilesystemState(ctx, tmpDir, state, nil)
+	if err != nil {
+		t.Fatalf("aggregateHashFromFilesystemState failed: %v", err)
+	}
+	if ok {
+		t.Fatal("expected fast-path mismatch after adding file")
+	}
+}
+
+func TestAggregateHashFromFilesystemStateDetectsGoFileInPreviouslyNonGoDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, "docs"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "docs", "readme.txt"), []byte("hi"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "main.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	idx, err := BuildFileIndex(ctx, tmpDir)
+	if err != nil {
+		t.Fatalf("BuildFileIndex failed: %v", err)
+	}
+	_, state, err := computeAggregateHash(ctx, idx, nil)
+	if err != nil {
+		t.Fatalf("computeAggregateHash failed: %v", err)
+	}
+
+	time.Sleep(2 * time.Millisecond)
+	if err := os.WriteFile(filepath.Join(tmpDir, "docs", "new.go"), []byte("package docs\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, ok, err := aggregateHashFromFilesystemState(ctx, tmpDir, state, nil)
+	if err != nil {
+		t.Fatalf("aggregateHashFromFilesystemState failed: %v", err)
+	}
+	if ok {
+		t.Fatal("expected mismatch after adding go file in previously non-go directory")
 	}
 }
