@@ -16,41 +16,42 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const (
-	codemapStateVersion    = 3
+	codemapStateVersion    = 4
 	analysisCacheVersionV2 = 2
 )
 
 type cachedStateFile struct {
-	modTimeUnixNano int64
-	size            int64
-	state           *CodemapState
+	state *CodemapState
 }
 
 type cachedAnalysisFile struct {
-	modTimeUnixNano int64
-	size            int64
-	cache           *AnalysisCache
+	cache *AnalysisCache
 }
 
 type cachedHashFile struct {
-	modTimeUnixNano int64
-	size            int64
-	hash            string
+	hash string
 }
 
 var (
 	stateFileCacheMu sync.RWMutex
 	stateFileCache   = make(map[string]cachedStateFile)
+	stateFlushMu     sync.Mutex
+	stateLastFlush   = make(map[string]time.Time)
 
 	analysisFileCacheMu sync.RWMutex
 	analysisFileCache   = make(map[string]cachedAnalysisFile)
+	analysisFlushMu     sync.Mutex
+	analysisLastFlush   = make(map[string]time.Time)
 
 	hashFileCacheMu sync.RWMutex
 	hashFileCache   = make(map[string]cachedHashFile)
 )
+
+const writeFlushInterval = 100 * time.Millisecond
 
 // StateEntry stores per-file metadata for incremental hashing.
 type StateEntry struct {
@@ -820,21 +821,10 @@ func hashFileContents(path string) (string, error) {
 }
 
 func readState(path string) (*CodemapState, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			stateFileCacheMu.Lock()
-			delete(stateFileCache, path)
-			stateFileCacheMu.Unlock()
-			return nil, nil
-		}
-		return nil, err
-	}
-
 	stateFileCacheMu.RLock()
 	cached, ok := stateFileCache[path]
 	stateFileCacheMu.RUnlock()
-	if ok && cached.modTimeUnixNano == info.ModTime().UnixNano() && cached.size == info.Size() {
+	if ok {
 		return cached.state, nil
 	}
 
@@ -873,9 +863,7 @@ func readState(path string) (*CodemapState, error) {
 	cloned := cloneCodemapState(&state)
 	stateFileCacheMu.Lock()
 	stateFileCache[path] = cachedStateFile{
-		modTimeUnixNano: info.ModTime().UnixNano(),
-		size:            info.Size(),
-		state:           cloned,
+		state: cloned,
 	}
 	stateFileCacheMu.Unlock()
 	return cloned, nil
@@ -889,12 +877,25 @@ func writeState(path string, state *CodemapState) error {
 	// Keep analysis cache out of the hot-path state file.
 	stateForDisk := *state
 	stateForDisk.Analysis = nil
+	cachedCopy := cloneCodemapState(&stateForDisk)
+	stateFileCacheMu.Lock()
+	stateFileCache[path] = cachedStateFile{state: cachedCopy}
+	stateFileCacheMu.Unlock()
 
-	data, err := json.MarshalIndent(stateForDisk, "", "  ")
+	now := time.Now()
+	stateFlushMu.Lock()
+	lastFlush, haveFlush := stateLastFlush[path]
+	if haveFlush && now.Sub(lastFlush) < writeFlushInterval {
+		stateFlushMu.Unlock()
+		return nil
+	}
+	stateLastFlush[path] = now
+	stateFlushMu.Unlock()
+
+	data, err := json.Marshal(stateForDisk)
 	if err != nil {
 		return err
 	}
-	data = append(data, '\n')
 
 	tmpPath := path + ".tmp"
 	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
@@ -905,16 +906,6 @@ func writeState(path string, state *CodemapState) error {
 		return err
 	}
 
-	if info, err := os.Stat(path); err == nil {
-		cachedCopy := cloneCodemapState(&stateForDisk)
-		stateFileCacheMu.Lock()
-		stateFileCache[path] = cachedStateFile{
-			modTimeUnixNano: info.ModTime().UnixNano(),
-			size:            info.Size(),
-			state:           cachedCopy,
-		}
-		stateFileCacheMu.Unlock()
-	}
 	return nil
 }
 
@@ -940,21 +931,10 @@ func resolveAnalysisStatePath(root string, opts Options) string {
 }
 
 func readAnalysisCache(path string) (*AnalysisCache, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			analysisFileCacheMu.Lock()
-			delete(analysisFileCache, path)
-			analysisFileCacheMu.Unlock()
-			return nil, nil
-		}
-		return nil, err
-	}
-
 	analysisFileCacheMu.RLock()
 	cached, ok := analysisFileCache[path]
 	analysisFileCacheMu.RUnlock()
-	if ok && cached.modTimeUnixNano == info.ModTime().UnixNano() && cached.size == info.Size() {
+	if ok {
 		return cached.cache, nil
 	}
 
@@ -983,9 +963,7 @@ func readAnalysisCache(path string) (*AnalysisCache, error) {
 	cacheCopy := cloneAnalysisCache(&cache)
 	analysisFileCacheMu.Lock()
 	analysisFileCache[path] = cachedAnalysisFile{
-		modTimeUnixNano: info.ModTime().UnixNano(),
-		size:            info.Size(),
-		cache:           cacheCopy,
+		cache: cacheCopy,
 	}
 	analysisFileCacheMu.Unlock()
 	return cacheCopy, nil
@@ -999,14 +977,31 @@ func writeAnalysisCache(path string, cache *AnalysisCache) error {
 		analysisFileCacheMu.Lock()
 		delete(analysisFileCache, path)
 		analysisFileCacheMu.Unlock()
+		analysisFlushMu.Lock()
+		delete(analysisLastFlush, path)
+		analysisFlushMu.Unlock()
 		return nil
 	}
 
-	data, err := json.MarshalIndent(cache, "", "  ")
+	cacheCopy := cloneAnalysisCache(cache)
+	analysisFileCacheMu.Lock()
+	analysisFileCache[path] = cachedAnalysisFile{cache: cacheCopy}
+	analysisFileCacheMu.Unlock()
+
+	now := time.Now()
+	analysisFlushMu.Lock()
+	lastFlush, haveFlush := analysisLastFlush[path]
+	if haveFlush && now.Sub(lastFlush) < writeFlushInterval {
+		analysisFlushMu.Unlock()
+		return nil
+	}
+	analysisLastFlush[path] = now
+	analysisFlushMu.Unlock()
+
+	data, err := json.Marshal(cache)
 	if err != nil {
 		return err
 	}
-	data = append(data, '\n')
 
 	tmpPath := path + ".tmp"
 	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
@@ -1016,37 +1011,15 @@ func writeAnalysisCache(path string, cache *AnalysisCache) error {
 		_ = os.Remove(tmpPath)
 		return err
 	}
-
-	if info, err := os.Stat(path); err == nil {
-		cacheCopy := cloneAnalysisCache(cache)
-		analysisFileCacheMu.Lock()
-		analysisFileCache[path] = cachedAnalysisFile{
-			modTimeUnixNano: info.ModTime().UnixNano(),
-			size:            info.Size(),
-			cache:           cacheCopy,
-		}
-		analysisFileCacheMu.Unlock()
-	}
 	return nil
 }
 
 // ReadExistingHash reads the hash from an existing codemap output file.
 func ReadExistingHash(path string) (string, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			hashFileCacheMu.Lock()
-			delete(hashFileCache, path)
-			hashFileCacheMu.Unlock()
-			return "", nil
-		}
-		return "", err
-	}
-
 	hashFileCacheMu.RLock()
 	cached, ok := hashFileCache[path]
 	hashFileCacheMu.RUnlock()
-	if ok && cached.modTimeUnixNano == info.ModTime().UnixNano() && cached.size == info.Size() {
+	if ok {
 		return cached.hash, nil
 	}
 
@@ -1070,9 +1043,7 @@ func ReadExistingHash(path string) (string, error) {
 		if hash := parseHashLine(line); hash != "" {
 			hashFileCacheMu.Lock()
 			hashFileCache[path] = cachedHashFile{
-				modTimeUnixNano: info.ModTime().UnixNano(),
-				size:            info.Size(),
-				hash:            hash,
+				hash: hash,
 			}
 			hashFileCacheMu.Unlock()
 			return hash, nil
@@ -1088,9 +1059,7 @@ func ReadExistingHash(path string) (string, error) {
 
 	hashFileCacheMu.Lock()
 	hashFileCache[path] = cachedHashFile{
-		modTimeUnixNano: info.ModTime().UnixNano(),
-		size:            info.Size(),
-		hash:            "",
+		hash: "",
 	}
 	hashFileCacheMu.Unlock()
 	return "", nil
@@ -1132,15 +1101,9 @@ func parseHashLine(line string) string {
 }
 
 func cacheExistingHash(path, hash string) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return
-	}
 	hashFileCacheMu.Lock()
 	hashFileCache[path] = cachedHashFile{
-		modTimeUnixNano: info.ModTime().UnixNano(),
-		size:            info.Size(),
-		hash:            hash,
+		hash: hash,
 	}
 	hashFileCacheMu.Unlock()
 }
@@ -1185,20 +1148,45 @@ func IsStale(ctx context.Context, opts Options) (bool, error) {
 		return false, fmt.Errorf("read state: %w", err)
 	}
 	ignoredRootEntries := ignoredRootEntryNames(root, opts)
-	currentHash, matchedFromState, err := aggregateHashFromFilesystemState(ctx, root, state, ignoredRootEntries)
+	idx, unchangedFromState, err := buildFileIndexFromState(ctx, root, state, ignoredRootEntries)
 	if err != nil {
-		return false, fmt.Errorf("verify state: %w", err)
+		return false, fmt.Errorf("build file index from state: %w", err)
 	}
-	if !matchedFromState {
-		idx, _, err := buildFileIndexFromState(ctx, root, state, ignoredRootEntries)
-		if err != nil {
-			return false, fmt.Errorf("build file index from state: %w", err)
+
+	var currentHash string
+	if idx != nil {
+		currentHash = state.AggregateHash
+		if !unchangedFromState {
+			currentHash, err = computeAggregateHashOnly(ctx, idx, state)
+			if err != nil {
+				return false, fmt.Errorf("compute hash: %w", err)
+			}
 		}
-		if idx == nil {
+	} else {
+		var matchedFromState bool
+		currentHash, matchedFromState, err = aggregateHashFromFilesystemState(ctx, root, state, ignoredRootEntries)
+		if err != nil {
+			return false, fmt.Errorf("verify state: %w", err)
+		}
+		if !matchedFromState {
 			idx, err = BuildFileIndex(ctx, root)
 			if err != nil {
 				return false, fmt.Errorf("build file index: %w", err)
 			}
+			currentHash, err = computeAggregateHashOnly(ctx, idx, state)
+			if err != nil {
+				return false, fmt.Errorf("compute hash: %w", err)
+			}
+		}
+		if matchedFromState {
+			currentHash = state.AggregateHash
+		}
+	}
+
+	if currentHash == "" {
+		idx, err = BuildFileIndex(ctx, root)
+		if err != nil {
+			return false, fmt.Errorf("build file index: %w", err)
 		}
 		currentHash, err = computeAggregateHashOnly(ctx, idx, state)
 		if err != nil {

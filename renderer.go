@@ -110,65 +110,94 @@ func EnsureUpToDate(ctx context.Context, opts Options) (*Codemap, bool, error) {
 	pathsPath := filepath.Join(root, opts.PathsOutputPath)
 	ignoredRootEntries := ignoredRootEntryNames(root, opts)
 
-	// Warm fast-path: if filesystem metadata still matches cached state, avoid full index/hash work.
-	currentHash, matchedFromState, err := aggregateHashFromFilesystemState(ctx, root, state, ignoredRootEntries)
+	existingHash, err := ReadExistingHash(outputPath)
 	if err != nil {
-		return nil, false, fmt.Errorf("verify state: %w", err)
+		return nil, false, fmt.Errorf("read existing hash: %w", err)
 	}
-	if matchedFromState {
-		existingHash, err := ReadExistingHash(outputPath)
+	var existingPathsHash string
+	if !opts.DisablePaths {
+		existingPathsHash, err = ReadExistingHash(pathsPath)
 		if err != nil {
-			return nil, false, fmt.Errorf("read existing hash: %w", err)
+			return nil, false, fmt.Errorf("read existing paths hash: %w", err)
+		}
+	}
+
+	idx, unchangedFromState, err := buildFileIndexFromState(ctx, root, state, ignoredRootEntries)
+	if err != nil {
+		return nil, false, fmt.Errorf("build file index from state: %w", err)
+	}
+	if idx != nil {
+		currentHash := state.AggregateHash
+		if !unchangedFromState {
+			currentHash, err = computeAggregateHashOnly(ctx, idx, state)
+			if err != nil {
+				return nil, false, fmt.Errorf("compute hash: %w", err)
+			}
 		}
 		if existingHash != "" && existingHash == currentHash {
 			if opts.DisablePaths {
 				return nil, false, nil
 			}
-
-			existingPathsHash, err := ReadExistingHash(pathsPath)
-			if err != nil {
-				return nil, false, fmt.Errorf("read existing paths hash: %w", err)
-			}
 			if existingPathsHash != "" && existingPathsHash == currentHash {
+				return nil, false, nil
+			}
+		}
+
+		currentHash, nextState, err := computeAggregateHash(ctx, idx, state)
+		if err != nil {
+			return nil, false, fmt.Errorf("compute hash: %w", err)
+		}
+		if existingHash != "" && existingHash == currentHash {
+			if opts.DisablePaths || (existingPathsHash != "" && existingPathsHash == currentHash) {
+				return nil, false, nil
+			}
+		}
+		return generateOutputs(ctx, root, opts, outputPath, pathsPath, statePath, state, nextState, currentHash, idx, markdownRenderer, pathsRenderer)
+	}
+
+	// Fallback warm fast-path: if filesystem metadata still matches cached state, avoid full index/hash work.
+	currentHash, matchedFromState, err := aggregateHashFromFilesystemState(ctx, root, state, ignoredRootEntries)
+	if err != nil {
+		return nil, false, fmt.Errorf("verify state: %w", err)
+	}
+	if matchedFromState {
+		if existingHash != "" && existingHash == currentHash {
+			if opts.DisablePaths || (existingPathsHash != "" && existingPathsHash == currentHash) {
 				return nil, false, nil
 			}
 		}
 	}
 
-	idx, _, err := buildFileIndexFromState(ctx, root, state, ignoredRootEntries)
+	idx, err = BuildFileIndex(ctx, root)
 	if err != nil {
-		return nil, false, fmt.Errorf("build file index from state: %w", err)
-	}
-	if idx == nil {
-		idx, err = BuildFileIndex(ctx, root)
-		if err != nil {
-			return nil, false, fmt.Errorf("build file index: %w", err)
-		}
+		return nil, false, fmt.Errorf("build file index: %w", err)
 	}
 	currentHash, nextState, err := computeAggregateHash(ctx, idx, state)
 	if err != nil {
 		return nil, false, fmt.Errorf("compute hash: %w", err)
 	}
-
-	// If full recompute still matches existing outputs, skip generation.
-	existingHash, err := ReadExistingHash(outputPath)
-	if err != nil {
-		return nil, false, fmt.Errorf("read existing hash: %w", err)
-	}
 	if existingHash != "" && existingHash == currentHash {
-		if opts.DisablePaths {
-			return nil, false, nil
-		}
-
-		existingPathsHash, err := ReadExistingHash(pathsPath)
-		if err != nil {
-			return nil, false, fmt.Errorf("read existing paths hash: %w", err)
-		}
-		if existingPathsHash != "" && existingPathsHash == currentHash {
+		if opts.DisablePaths || (existingPathsHash != "" && existingPathsHash == currentHash) {
 			return nil, false, nil
 		}
 	}
+	return generateOutputs(ctx, root, opts, outputPath, pathsPath, statePath, state, nextState, currentHash, idx, markdownRenderer, pathsRenderer)
+}
 
+func generateOutputs(
+	ctx context.Context,
+	root string,
+	opts Options,
+	outputPath string,
+	pathsPath string,
+	statePath string,
+	state *CodemapState,
+	nextState *CodemapState,
+	currentHash string,
+	idx *FileIndex,
+	markdownRenderer MarkdownRenderer,
+	pathsRenderer PathsRenderer,
+) (*Codemap, bool, error) {
 	analysisPath := resolveAnalysisStatePath(root, opts)
 	analysisCache, err := readAnalysisCache(analysisPath)
 	if err != nil {
@@ -195,7 +224,6 @@ func EnsureUpToDate(ctx context.Context, opts Options) (*Codemap, bool, error) {
 		return nil, false, err
 	}
 	if !opts.DisablePaths {
-		pathsPath := filepath.Join(root, opts.PathsOutputPath)
 		if err := writeRenderedOutput(pathsPath, pathsRenderer, cm); err != nil {
 			return nil, false, err
 		}
