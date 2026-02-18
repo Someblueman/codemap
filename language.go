@@ -26,7 +26,7 @@ type languageMatch struct {
 }
 
 func defaultLanguageSpecs() []LanguageSpec {
-	specs, err := resolveLanguageSpecs(nil)
+	specs, err := resolveLanguageSpecs(DefaultAnalyzerRegistry().LanguageIDs())
 	if err != nil {
 		// Built-ins should always resolve.
 		panic(err)

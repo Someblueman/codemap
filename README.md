@@ -1,6 +1,6 @@
 # codemap
 
-A CLI tool that analyzes Go codebases and generates a small set of codemap outputs for fast navigation:
+A CLI tool that analyzes Go and Rust codebases and generates a small set of codemap outputs for fast navigation:
 
 - `CODEMAP.paths`: token-efficient package → entry file routing (best for agents)
 - `CODEMAP.md`: human-friendly summary (kept small)
