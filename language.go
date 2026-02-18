@@ -131,7 +131,13 @@ func dominantLanguage(idx *FileIndex, fallback string) string {
 
 	bestID := fallback
 	bestCount := -1
-	for id, count := range counts {
+	ids := make([]string, 0, len(counts))
+	for id := range counts {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		count := counts[id]
 		if count > bestCount || (count == bestCount && id < bestID) {
 			bestID = id
 			bestCount = count

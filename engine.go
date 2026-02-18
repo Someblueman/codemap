@@ -78,7 +78,7 @@ func DefaultAnalyzerRegistry() *AnalyzerRegistry {
 	return registry
 }
 
-// AnalyzeWithRegistry selects a language analyzer from the index and runs analysis.
+// AnalyzeWithRegistry runs analyzers for all detected languages in deterministic order.
 func AnalyzeWithRegistry(ctx context.Context, in AnalysisInput, registry *AnalyzerRegistry) (*Codemap, error) {
 	if in.Index == nil {
 		return nil, errors.New("missing file index")
@@ -87,16 +87,96 @@ func AnalyzeWithRegistry(ctx context.Context, in AnalysisInput, registry *Analyz
 		registry = DefaultAnalyzerRegistry()
 	}
 
-	languageID := dominantLanguage(in.Index, languageGo)
-	analyzer, ok := registry.AnalyzerFor(languageID)
-	if !ok {
-		// Keep current behavior stable until every indexed language has a dedicated analyzer.
-		analyzer, ok = registry.AnalyzerFor(languageGo)
+	selectedIDs := selectedAnalyzerLanguageIDs(in.Index, registry)
+	if len(selectedIDs) == 0 {
+		fallback, ok := fallbackAnalyzerLanguageID(registry)
+		if !ok {
+			return nil, errors.New("no analyzers registered")
+		}
+		selectedIDs = []string{fallback}
+	}
+
+	merged := &Codemap{
+		ProjectRoot: in.Root,
+		Packages:    make([]Package, 0),
+	}
+
+	for i, languageID := range selectedIDs {
+		analyzer, ok := registry.AnalyzerFor(languageID)
 		if !ok {
 			return nil, fmt.Errorf("no analyzer registered for language: %s", languageID)
 		}
+		cm, err := analyzer.Analyze(ctx, in)
+		if err != nil {
+			return nil, err
+		}
+		if cm == nil {
+			continue
+		}
+		merged.Packages = append(merged.Packages, cm.Packages...)
+		if i == 0 {
+			merged.Concerns = cm.Concerns
+		}
 	}
-	return analyzer.Analyze(ctx, in)
+
+	sortPackages(merged.Packages)
+	if merged.Concerns == nil {
+		concerns, err := buildConcerns(in.Index, in.Options.Concerns, in.Options.ConcernExampleLimit)
+		if err != nil {
+			return nil, fmt.Errorf("build concerns: %w", err)
+		}
+		merged.Concerns = concerns
+	}
+	return merged, nil
+}
+
+func selectedAnalyzerLanguageIDs(idx *FileIndex, registry *AnalyzerRegistry) []string {
+	if idx == nil || registry == nil {
+		return nil
+	}
+	present := make(map[string]struct{})
+	for _, rec := range idx.Files {
+		if rec.Language == "" {
+			continue
+		}
+		present[rec.Language] = struct{}{}
+	}
+	ids := make([]string, 0, len(present))
+	for _, id := range registry.LanguageIDs() {
+		if _, ok := present[id]; ok {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+func fallbackAnalyzerLanguageID(registry *AnalyzerRegistry) (string, bool) {
+	if registry == nil {
+		return "", false
+	}
+	if _, ok := registry.AnalyzerFor(languageGo); ok {
+		return languageGo, true
+	}
+	ids := registry.LanguageIDs()
+	if len(ids) == 0 {
+		return "", false
+	}
+	return ids[0], true
+}
+
+func sortPackages(packages []Package) {
+	sort.Slice(packages, func(i, j int) bool {
+		if packages[i].RelativePath != packages[j].RelativePath {
+			return packages[i].RelativePath < packages[j].RelativePath
+		}
+		if packages[i].ImportPath != packages[j].ImportPath {
+			return packages[i].ImportPath < packages[j].ImportPath
+		}
+		if packages[i].EntryPoint != packages[j].EntryPoint {
+			return packages[i].EntryPoint < packages[j].EntryPoint
+		}
+		return packages[i].Purpose < packages[j].Purpose
+	})
 }
 
 // Renderer formats a codemap model into an output artifact.

@@ -11,20 +11,20 @@ type Codemap struct {
 	Concerns    []Concern
 }
 
-// Package represents a Go package with its metadata.
+// Package represents a logical code package/module with metadata.
 type Package struct {
 	ImportPath    string
 	RelativePath  string // e.g., "internal/supervisor"
-	Purpose       string // From doc.go or package comment
+	Purpose       string // Derived from package/file-level comments when available.
 	FileCount     int
 	LineCount     int
 	Files         []File // Only populated for large packages
 	ExportedTypes []TypeInfo
-	Imports       []string // Internal imports only
+	Imports       []string // Package-local or internal import references.
 	EntryPoint    string   // Suggested first file to read
 }
 
-// File represents a Go source file.
+// File represents a source file.
 type File struct {
 	Name      string
 	LineCount int
@@ -86,8 +86,63 @@ func DefaultOptions() Options {
 }
 
 var defaultConcerns = []ConcernDef{
-	{Name: "Error Handling", Patterns: []string{"**/error*.go", "**/recovery*.go"}},
-	{Name: "Testing", Patterns: []string{"**/*_test.go"}},
-	{Name: "CLI", Patterns: []string{"cmd/**/*.go", "**/cli_*.go"}},
-	{Name: "Configuration", Patterns: []string{"**/config*.go", "**/options*.go"}},
+	{
+		Name: "Error Handling",
+		Patterns: []string{
+			"**/error*.go",
+			"**/recovery*.go",
+			"**/*error*.rs",
+			"**/*result*.rs",
+			"**/*error*.ts",
+			"**/*error*.tsx",
+			"**/*error*.mts",
+			"**/*error*.cts",
+		},
+	},
+	{
+		Name: "Testing",
+		Patterns: []string{
+			"**/*_test.go",
+			"tests/**/*.rs",
+			"**/*.test.rs",
+			"**/*.spec.rs",
+			"**/*.test.ts",
+			"**/*.spec.ts",
+			"**/*.test.tsx",
+			"**/*.spec.tsx",
+			"**/*.test.mts",
+			"**/*.spec.mts",
+			"**/*.test.cts",
+			"**/*.spec.cts",
+			"__tests__/**/*.ts",
+			"__tests__/**/*.tsx",
+			"__tests__/**/*.mts",
+			"__tests__/**/*.cts",
+		},
+	},
+	{
+		Name: "CLI",
+		Patterns: []string{
+			"cmd/**/*.go",
+			"**/cli_*.go",
+			"src/bin/**/*.rs",
+			"**/cli*.ts",
+			"**/cli*.tsx",
+			"**/cli*.mts",
+			"**/cli*.cts",
+		},
+	},
+	{
+		Name: "Configuration",
+		Patterns: []string{
+			"**/config*.go",
+			"**/options*.go",
+			"**/config*.rs",
+			"**/settings*.rs",
+			"**/*config*.ts",
+			"**/*config*.tsx",
+			"**/*config*.mts",
+			"**/*config*.cts",
+		},
+	},
 }

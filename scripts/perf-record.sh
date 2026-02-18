@@ -8,6 +8,17 @@ bench_pattern="${BENCH_PATTERN:-^BenchmarkCodemap}"
 bench_time="${BENCH_TIME:-1s}"
 bench_count="${BENCH_COUNT:-3}"
 
+if ! command -v go >/dev/null 2>&1; then
+  echo "Skipping benchmarks: Go toolchain is not installed."
+  exit 0
+fi
+
+gomod="$(go env GOMOD 2>/dev/null || true)"
+if [[ -z "${gomod}" || "${gomod}" == "/dev/null" ]]; then
+  echo "Skipping benchmarks: repository is not a Go module (no go.mod)."
+  exit 0
+fi
+
 mkdir -p perf/history
 history_csv="perf/history.csv"
 

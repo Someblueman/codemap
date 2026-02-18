@@ -70,3 +70,20 @@ func TestDominantLanguage(t *testing.T) {
 		t.Fatalf("expected dominant language %q, got %q", languageGo, got)
 	}
 }
+
+func TestDominantLanguageTieBreaksDeterministically(t *testing.T) {
+	idx := &FileIndex{
+		Files: []FileRecord{
+			{Language: languageTypeScript},
+			{Language: languageRust},
+			{Language: languageTypeScript},
+			{Language: languageRust},
+		},
+	}
+
+	for i := 0; i < 100; i++ {
+		if got := dominantLanguage(idx, languageGo); got != languageRust {
+			t.Fatalf("expected deterministic tie-break to pick %q, got %q", languageRust, got)
+		}
+	}
+}

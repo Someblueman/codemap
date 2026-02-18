@@ -7,6 +7,8 @@ A CLI tool that analyzes Go, Rust, and TypeScript codebases and generates a smal
 
 ## Installation
 
+`codemap` is implemented in Go. Building from source or using `go install` requires a Go toolchain (see `go.mod` for the current minimum version).
+
 ```bash
 go install github.com/Someblueman/codemap@latest
 ```
@@ -107,7 +109,7 @@ If `CODEMAP.md` / `CODEMAP.paths` are ignored, the hook still refreshes them loc
 
 ## Performance Tracking
 
-You can track codemap performance over time using built-in benchmarks:
+You can track `codemap` performance over time using built-in synthetic benchmarks that exercise Go, Rust, and TypeScript fixture repos:
 
 ```bash
 ./scripts/perf-record.sh
@@ -115,6 +117,7 @@ You can track codemap performance over time using built-in benchmarks:
 ```
 
 This records benchmark history in `perf/history.csv` and stores raw benchmark outputs in `perf/history/`.
+If you run `perf-record.sh` outside this repo (or on a machine without Go), it exits cleanly and skips recording.
 
 CI also runs codemap benchmarks via `.github/workflows/perf-bench.yml` and publishes artifacts per run.
 For persistent in-repo trend lines, this repo also has a weekly cadence workflow:
