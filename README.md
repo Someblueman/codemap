@@ -109,7 +109,7 @@ If `CODEMAP.md` / `CODEMAP.paths` are ignored, the hook still refreshes them loc
 
 ## Performance Tracking
 
-You can track codemap performance over time using built-in benchmarks (Go, Rust, and TypeScript fixture repos):
+You can track `codemap` performance over time using built-in synthetic benchmarks that exercise Go, Rust, and TypeScript fixture repos:
 
 ```bash
 ./scripts/perf-record.sh
@@ -117,7 +117,7 @@ You can track codemap performance over time using built-in benchmarks (Go, Rust,
 ```
 
 This records benchmark history in `perf/history.csv` and stores raw benchmark outputs in `perf/history/`.
-If you run `perf-record.sh` in a non-Go repository (or a machine without Go), it exits cleanly and skips recording.
+If you run `perf-record.sh` outside this repo (or on a machine without Go), it exits cleanly and skips recording.
 
 CI also runs codemap benchmarks via `.github/workflows/perf-bench.yml` and publishes artifacts per run.
 For persistent in-repo trend lines, this repo also has a weekly cadence workflow:

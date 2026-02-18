@@ -15,12 +15,12 @@ type Codemap struct {
 type Package struct {
 	ImportPath    string
 	RelativePath  string // e.g., "internal/supervisor"
-	Purpose       string // From doc.go or package comment
+	Purpose       string // Derived from package/file-level comments when available.
 	FileCount     int
 	LineCount     int
 	Files         []File // Only populated for large packages
 	ExportedTypes []TypeInfo
-	Imports       []string // Internal imports only
+	Imports       []string // Package-local or internal import references.
 	EntryPoint    string   // Suggested first file to read
 }
 
