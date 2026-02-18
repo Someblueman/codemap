@@ -73,6 +73,7 @@ func (r *AnalyzerRegistry) LanguageIDs() []string {
 func DefaultAnalyzerRegistry() *AnalyzerRegistry {
 	registry := NewAnalyzerRegistry()
 	registry.Register(GoAnalyzer{})
+	registry.Register(TypeScriptAnalyzer{})
 	registry.Register(RustAnalyzer{})
 	return registry
 }
