@@ -137,7 +137,7 @@ func cloneAnalysisCache(cache *AnalysisCache) *AnalysisCache {
 	return out
 }
 
-// ComputeHash computes a deterministic hash of all Go files in the project.
+// ComputeHash computes a deterministic hash of all tracked source files in the project.
 func ComputeHash(ctx context.Context, root string) (string, error) {
 	idx, err := BuildFileIndex(ctx, root)
 	if err != nil {
@@ -505,7 +505,7 @@ dispatch:
 }
 
 func fileEntryMatches(absRoot string, entry StateEntry) (bool, error) {
-	if !strings.HasSuffix(entry.RelPath, ".go") || entry.ContentHash == "" {
+	if inferLanguageForPath(entry.RelPath) == "" || entry.ContentHash == "" {
 		return false, nil
 	}
 
@@ -594,13 +594,16 @@ func buildFileIndexFromState(ctx context.Context, absRoot string, prev *CodemapS
 				unchanged.Store(false)
 			}
 
+			lang := inferLanguageForPath(entry.RelPath)
+			match, _ := matchLanguageForPath(entry.RelPath, allBuiltinLanguageSpecs())
 			fileRecords[idx] = FileRecord{
 				AbsPath:         absPath,
 				RelPath:         entry.RelPath,
 				Size:            size,
 				ModTimeUnixNano: modTimeUnixNano,
-				IsGo:            true,
-				IsTest:          strings.HasSuffix(entry.RelPath, "_test.go"),
+				Language:        lang,
+				IsGo:            lang == languageGo,
+				IsTest:          match.IsTest,
 			}
 		}
 	}
