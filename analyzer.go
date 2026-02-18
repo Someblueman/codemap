@@ -466,6 +466,8 @@ type analysisResult struct {
 	err   error
 }
 
+type packageAnalyzerFunc func(job analysisJob) (*Package, error)
+
 func stateEntryByRelPath(state *CodemapState) map[string]StateEntry {
 	if state == nil || len(state.Entries) == 0 {
 		return nil
@@ -556,7 +558,16 @@ func cachedPackagesByPath(prevState *CodemapState, opts Options, modulePath stri
 }
 
 func analyzePackagesParallel(ctx context.Context, root, modulePath string, opts Options, jobs []analysisJob, out []*Package) error {
+	return analyzePackagePlansParallel(ctx, opts, jobs, out, func(job analysisJob) (*Package, error) {
+		return analyzePackage(token.NewFileSet(), root, job.dir, modulePath, opts)
+	})
+}
+
+func analyzePackagePlansParallel(ctx context.Context, opts Options, jobs []analysisJob, out []*Package, analyze packageAnalyzerFunc) error {
 	if len(jobs) == 0 {
+		return nil
+	}
+	if analyze == nil {
 		return nil
 	}
 
@@ -575,7 +586,7 @@ func analyzePackagesParallel(ctx context.Context, root, modulePath string, opts 
 				return ctx.Err()
 			default:
 			}
-			pkg, err := analyzePackage(token.NewFileSet(), root, job.dir, modulePath, opts)
+			pkg, err := analyze(job)
 			if err != nil {
 				if opts.Verbose {
 					fmt.Fprintf(os.Stderr, "warning: skipping %s: %v\n", job.dir, err)
@@ -594,7 +605,7 @@ func analyzePackagesParallel(ctx context.Context, root, modulePath string, opts 
 	worker := func() {
 		defer wg.Done()
 		for job := range jobsCh {
-			pkg, err := analyzePackage(token.NewFileSet(), root, job.dir, modulePath, opts)
+			pkg, err := analyze(job)
 			select {
 			case resultsCh <- analysisResult{
 				index: job.index,

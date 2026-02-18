@@ -268,3 +268,56 @@ func TestScoreTypeScriptEntryPointHeuristics(t *testing.T) {
 		t.Fatalf("unexpected score ordering: srcIndex=%d rootIndex=%d srcMain=%d bin=%d", srcIndexScore, rootIndexScore, srcMainScore, binScore)
 	}
 }
+
+func TestAnalyzeTypeScriptWithIndexSkipsBrokenPackageAndKeepsHealthyOnes(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	healthyDir := filepath.Join(tmpDir, "packages", "healthy")
+	if err := os.MkdirAll(filepath.Join(healthyDir, "src"), 0755); err != nil {
+		t.Fatalf("mkdir healthy package: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(healthyDir, "package.json"), []byte("{\"name\":\"healthy\"}\n"), 0644); err != nil {
+		t.Fatalf("write healthy package.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(healthyDir, "src", "index.ts"), []byte("export const run = 1;\n"), 0644); err != nil {
+		t.Fatalf("write healthy index.ts: %v", err)
+	}
+
+	brokenDir := filepath.Join(tmpDir, "packages", "broken")
+	if err := os.MkdirAll(filepath.Join(brokenDir, "src"), 0755); err != nil {
+		t.Fatalf("mkdir broken package: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(brokenDir, "package.json"), []byte("{\"name\":\"broken\"}\n"), 0644); err != nil {
+		t.Fatalf("write broken package.json: %v", err)
+	}
+
+	brokenMissing := filepath.Join(brokenDir, "src", "index.ts")
+	idx := &FileIndex{
+		Root: tmpDir,
+		Files: []FileRecord{
+			{
+				AbsPath:  filepath.Join(healthyDir, "src", "index.ts"),
+				RelPath:  "packages/healthy/src/index.ts",
+				Language: languageTypeScript,
+			},
+			{
+				AbsPath:  brokenMissing,
+				RelPath:  "packages/broken/src/index.ts",
+				Language: languageTypeScript,
+			},
+		},
+	}
+
+	opts := DefaultOptions()
+	opts.ProjectRoot = tmpDir
+	cm, err := analyzeTypeScriptWithIndex(context.Background(), tmpDir, idx, opts, nil, nil)
+	if err != nil {
+		t.Fatalf("analyzeTypeScriptWithIndex returned error: %v", err)
+	}
+	if len(cm.Packages) != 1 {
+		t.Fatalf("expected one healthy package, got %d", len(cm.Packages))
+	}
+	if cm.Packages[0].ImportPath != "healthy" {
+		t.Fatalf("expected healthy package to remain, got %q", cm.Packages[0].ImportPath)
+	}
+}

@@ -260,3 +260,56 @@ func TestScoreRustEntryPointHeuristics(t *testing.T) {
 		t.Fatalf("unexpected score ordering: main=%d lib=%d bin=%d mod=%d", mainScore, libScore, binScore, modScore)
 	}
 }
+
+func TestAnalyzeRustWithIndexSkipsBrokenPackageAndKeepsHealthyOnes(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	healthyDir := filepath.Join(tmpDir, "crates", "healthy")
+	if err := os.MkdirAll(filepath.Join(healthyDir, "src"), 0755); err != nil {
+		t.Fatalf("mkdir healthy crate: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(healthyDir, "Cargo.toml"), []byte("[package]\nname = \"healthy\"\nversion = \"0.1.0\"\n"), 0644); err != nil {
+		t.Fatalf("write healthy Cargo.toml: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(healthyDir, "src", "lib.rs"), []byte("pub fn run() {}\n"), 0644); err != nil {
+		t.Fatalf("write healthy lib.rs: %v", err)
+	}
+
+	brokenDir := filepath.Join(tmpDir, "crates", "broken")
+	if err := os.MkdirAll(filepath.Join(brokenDir, "src"), 0755); err != nil {
+		t.Fatalf("mkdir broken crate: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(brokenDir, "Cargo.toml"), []byte("[package]\nname = \"broken\"\nversion = \"0.1.0\"\n"), 0644); err != nil {
+		t.Fatalf("write broken Cargo.toml: %v", err)
+	}
+
+	brokenMissing := filepath.Join(brokenDir, "src", "lib.rs")
+	idx := &FileIndex{
+		Root: tmpDir,
+		Files: []FileRecord{
+			{
+				AbsPath:  filepath.Join(healthyDir, "src", "lib.rs"),
+				RelPath:  "crates/healthy/src/lib.rs",
+				Language: languageRust,
+			},
+			{
+				AbsPath:  brokenMissing,
+				RelPath:  "crates/broken/src/lib.rs",
+				Language: languageRust,
+			},
+		},
+	}
+
+	opts := DefaultOptions()
+	opts.ProjectRoot = tmpDir
+	cm, err := analyzeRustWithIndex(context.Background(), tmpDir, idx, opts, nil, nil)
+	if err != nil {
+		t.Fatalf("analyzeRustWithIndex returned error: %v", err)
+	}
+	if len(cm.Packages) != 1 {
+		t.Fatalf("expected one healthy package, got %d", len(cm.Packages))
+	}
+	if cm.Packages[0].ImportPath != "healthy" {
+		t.Fatalf("expected healthy package to remain, got %q", cm.Packages[0].ImportPath)
+	}
+}

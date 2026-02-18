@@ -46,6 +46,7 @@ func analyzeTypeScriptWithIndex(ctx context.Context, root string, idx *FileIndex
 	cachedByRel := cachedPackagesByPath(prevState, opts, modulePath)
 
 	packageResults := make([]*Package, len(plans))
+	jobs := make([]analysisJob, 0, len(plans))
 	for i := range plans {
 		plan := plans[i]
 		if cached, ok := cachedByRel[plan.RelativePath]; ok && plan.Fingerprint != "" && cached.Fingerprint == plan.Fingerprint {
@@ -53,18 +54,21 @@ func analyzeTypeScriptWithIndex(ctx context.Context, root string, idx *FileIndex
 			packageResults[i] = &pkg
 			continue
 		}
+		jobs = append(jobs, analysisJob{
+			index: i,
+			dir:   plan.DirAbsPath,
+		})
+	}
 
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-
+	if err := analyzePackagePlansParallel(ctx, opts, jobs, packageResults, func(job analysisJob) (*Package, error) {
+		plan := plans[job.index]
 		pkg, err := analyzeTypeScriptPackage(root, plan, packageNames[plan.RelativePath], opts)
 		if err != nil {
 			return nil, fmt.Errorf("analyze typescript package %s: %w", plan.RelativePath, err)
 		}
-		packageResults[i] = pkg
+		return pkg, nil
+	}); err != nil {
+		return nil, err
 	}
 
 	packages := make([]Package, 0, len(packageResults))
