@@ -39,4 +39,24 @@ This prints latest `ns/op` and delta against the previous sample per benchmark.
 
 GitHub Actions workflow `.github/workflows/perf-bench.yml` runs these benchmarks on pull requests, `main` pushes, and manual dispatch, then uploads benchmark artifacts.
 
-CI artifacts are per-run snapshots. For long-term in-repo trends, run `./scripts/perf-record.sh` locally and commit updated `perf/history.csv`.
+For persistent trend updates in git, workflow `.github/workflows/perf-history-cadence.yml` runs weekly (Monday 14:00 UTC) and opens/updates a PR with the new `perf/history.csv` sample.
+
+CI artifacts remain per-run snapshots. You can still run `./scripts/perf-record.sh` locally for ad-hoc checks.
+
+## Impact Collection Cadence (Local Machine)
+
+Use local scheduling for impact metrics because session logs live on your machine (`~/.codex/sessions`, `~/.claude/projects`).
+
+Install a daily launchd job:
+
+```bash
+./scripts/install-impact-launchd.sh --hour 9 --minute 0 --since-days 30 --run-now
+```
+
+Collector behavior:
+
+- Reads repos from `~/.codemap/impact/repos.txt`
+- Writes per-repo JSON snapshots to `perf/impact/`
+- Writes run metadata to `perf/impact/latest-run.json`
+
+Example repo list format: `perf/impact-repos.example.txt`

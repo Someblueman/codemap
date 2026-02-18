@@ -1,0 +1,60 @@
+name: Codemap Performance History Cadence
+
+on:
+  schedule:
+    - cron: "0 14 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-history:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.mod
+
+      - name: Record benchmark sample
+        env:
+          BENCH_PATTERN: "^BenchmarkCodemap"
+          BENCH_TIME: "250ms"
+          BENCH_COUNT: "1"
+        run: ./scripts/perf-record.sh
+
+      - name: Render benchmark summary
+        run: |
+          {
+            echo "## Codemap Benchmark Summary"
+            echo
+            echo "Recorded: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            echo
+            echo '```text'
+            ./scripts/perf-report.sh
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create or update history PR
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: "chore(perf): update benchmark history"
+          title: "chore(perf): update benchmark history"
+          body: |
+            Automated benchmark history update from the weekly cadence workflow.
+
+            - Runs `./scripts/perf-record.sh` with short benchmark settings.
+            - Appends a new sample to `perf/history.csv`.
+          branch: "chore/perf-history-cadence"
+          delete-branch: true
+          add-paths: |
+            perf/history.csv
