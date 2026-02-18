@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 )
 
 // AnalysisInput provides shared context for analyzer implementations.
@@ -55,10 +56,24 @@ func (r *AnalyzerRegistry) AnalyzerFor(languageID string) (LanguageAnalyzer, boo
 	return analyzer, ok
 }
 
+// LanguageIDs returns registered language IDs sorted lexicographically.
+func (r *AnalyzerRegistry) LanguageIDs() []string {
+	if r == nil || len(r.analyzers) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(r.analyzers))
+	for id := range r.analyzers {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
 // DefaultAnalyzerRegistry returns the current built-in analyzer registry.
 func DefaultAnalyzerRegistry() *AnalyzerRegistry {
 	registry := NewAnalyzerRegistry()
 	registry.Register(GoAnalyzer{})
+	registry.Register(RustAnalyzer{})
 	return registry
 }
 
@@ -74,7 +89,11 @@ func AnalyzeWithRegistry(ctx context.Context, in AnalysisInput, registry *Analyz
 	languageID := dominantLanguage(in.Index, languageGo)
 	analyzer, ok := registry.AnalyzerFor(languageID)
 	if !ok {
-		return nil, fmt.Errorf("no analyzer registered for language: %s", languageID)
+		// Keep current behavior stable until every indexed language has a dedicated analyzer.
+		analyzer, ok = registry.AnalyzerFor(languageGo)
+		if !ok {
+			return nil, fmt.Errorf("no analyzer registered for language: %s", languageID)
+		}
 	}
 	return analyzer.Analyze(ctx, in)
 }
