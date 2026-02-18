@@ -74,6 +74,7 @@ func DefaultAnalyzerRegistry() *AnalyzerRegistry {
 	registry := NewAnalyzerRegistry()
 	registry.Register(GoAnalyzer{})
 	registry.Register(TypeScriptAnalyzer{})
+	registry.Register(RustAnalyzer{})
 	return registry
 }
 

@@ -158,7 +158,7 @@ func analyzeTypeScriptPackage(root string, plan packagePlan, packageName string,
 			return nil, fmt.Errorf("read %s: %w", relPath, err)
 		}
 
-		lineCount := lineCountBytes(content)
+		lineCount := lineCountBytesTS(content)
 		totalLines += lineCount
 
 		withinPackage := relPath
@@ -416,7 +416,7 @@ func scoreTypeScriptEntryPoint(relPath string, keyTypes, keyFuncs []string) int 
 	return score
 }
 
-func lineCountBytes(content []byte) int {
+func lineCountBytesTS(content []byte) int {
 	if len(content) == 0 {
 		return 0
 	}

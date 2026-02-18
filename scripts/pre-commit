@@ -8,7 +8,7 @@ if ! root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
 fi
 
 # Only run when supported source files are staged.
-if ! git diff --cached --name-only --diff-filter=ACMR | grep -qE '\.(go|ts|tsx|mts|cts)$'; then
+if ! git diff --cached --name-only --diff-filter=ACMR | grep -qE '\.(go|rs|ts|tsx|mts|cts)$'; then
   exit 0
 fi
 
