@@ -1,0 +1,3 @@
+# One absolute repo path per line. Blank lines and # comments are ignored.
+/Users/your-user/Code/codemap
+/Users/your-user/Code/freebird

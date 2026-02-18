@@ -117,7 +117,13 @@ You can track codemap performance over time using built-in benchmarks:
 This records benchmark history in `perf/history.csv` and stores raw benchmark outputs in `perf/history/`.
 
 CI also runs codemap benchmarks via `.github/workflows/perf-bench.yml` and publishes artifacts per run.
-For persistent in-repo trend lines, run `./scripts/perf-record.sh` and commit the updated `perf/history.csv`.
+For persistent in-repo trend lines, this repo also has a weekly cadence workflow:
+
+- `.github/workflows/perf-history-cadence.yml` runs every Monday at 14:00 UTC.
+- It records a benchmark sample and opens/updates a PR with `perf/history.csv`.
+- You can also trigger it manually from GitHub Actions (`workflow_dispatch`).
+
+You can still run `./scripts/perf-record.sh` locally at any time for ad-hoc sampling.
 
 ## Impact Measurement (Experimental)
 
@@ -146,6 +152,30 @@ claude,7d2abdc1-f1c3-4f4b-b3cd-2cc75b2fb6f9,0
 ```bash
 python3 ./scripts/impact-report.py --repo /path/to/repo --outcomes-csv outcomes.csv
 ```
+
+### Local Scheduled Collection (Cross-Repo)
+
+Because impact metrics rely on local session logs (for example `~/.codex/sessions`), schedule collection on your own machine:
+
+```bash
+./scripts/install-impact-launchd.sh --hour 9 --minute 0 --since-days 30 --run-now
+```
+
+What this sets up:
+
+- Launch agent label: `com.someblueman.codemap.impact-collect`
+- Repo list file: `~/.codemap/impact/repos.txt` (one absolute path per line)
+- Output snapshots: `perf/impact/<repo-name>.json`
+- Run manifest: `perf/impact/latest-run.json`
+
+Useful commands:
+
+```bash
+launchctl print gui/$(id -u)/com.someblueman.codemap.impact-collect
+./scripts/install-impact-launchd.sh --uninstall
+```
+
+Repo list format example: `perf/impact-repos.example.txt`
 
 ## Excluded Directories
 
