@@ -25,12 +25,11 @@ func Analyze(ctx context.Context, opts Options) (*Codemap, error) {
 		return nil, fmt.Errorf("build file index: %w", err)
 	}
 
-	analyzer := GoAnalyzer{}
-	return analyzer.Analyze(ctx, AnalysisInput{
+	return AnalyzeWithRegistry(ctx, AnalysisInput{
 		Root:    idx.Root,
 		Index:   idx,
 		Options: opts,
-	})
+	}, DefaultAnalyzerRegistry())
 }
 
 func analyzeGoWithIndex(ctx context.Context, root string, idx *FileIndex, opts Options, prevState, nextState *CodemapState) (*Codemap, error) {

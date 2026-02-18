@@ -16,6 +16,7 @@ type FileRecord struct {
 	RelPath         string
 	Size            int64
 	ModTimeUnixNano int64
+	Language        string
 	IsGo            bool
 	IsTest          bool
 }
@@ -36,6 +37,11 @@ type FileIndex struct {
 
 // BuildFileIndex walks root once and captures all files needed by codemap.
 func BuildFileIndex(ctx context.Context, root string) (*FileIndex, error) {
+	return BuildFileIndexWithLanguages(ctx, root, defaultLanguageSpecs())
+}
+
+// BuildFileIndexWithLanguages walks root once and captures files matching configured languages.
+func BuildFileIndexWithLanguages(ctx context.Context, root string, languageSpecs []LanguageSpec) (*FileIndex, error) {
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		return nil, fmt.Errorf("resolve root: %w", err)
@@ -92,8 +98,8 @@ func BuildFileIndex(ctx context.Context, root string) (*FileIndex, error) {
 		}
 
 		name := d.Name()
-		isGo := strings.HasSuffix(name, ".go")
-		if !isGo {
+		langMatch, ok := matchLanguageForPath(name, languageSpecs)
+		if !ok {
 			return nil
 		}
 
@@ -122,8 +128,9 @@ func BuildFileIndex(ctx context.Context, root string) (*FileIndex, error) {
 			RelPath:         relPath,
 			Size:            info.Size(),
 			ModTimeUnixNano: info.ModTime().UnixNano(),
-			IsGo:            isGo,
-			IsTest:          strings.HasSuffix(name, "_test.go"),
+			Language:        langMatch.ID,
+			IsGo:            langMatch.ID == languageGo,
+			IsTest:          langMatch.IsTest,
 		})
 		return nil
 	})

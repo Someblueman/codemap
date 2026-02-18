@@ -44,3 +44,12 @@ timestamp,commit,goos,goarch,goversion,benchmark,run,iterations,ns_per_op,bytes_
 2026-02-10T23:48:08Z,95162e2,darwin,arm64,go1.25.0,BenchmarkCodemapIsStaleWarm,1,1430,868451,333843,1970
 2026-02-10T23:48:08Z,95162e2,darwin,arm64,go1.25.0,BenchmarkCodemapEnsureUpToDateWarm,1,1414,864068,336415,1970
 2026-02-10T23:48:08Z,95162e2,darwin,arm64,go1.25.0,BenchmarkCodemapEnsureUpToDateOnChange,1,1524,801923,476944,3241
+2026-02-18T13:55:20Z,43a2907,darwin,arm64,go1.25.0,BenchmarkCodemapIsStaleWarm,1,426,2829498,977859,5163
+2026-02-18T13:55:20Z,43a2907,darwin,arm64,go1.25.0,BenchmarkCodemapIsStaleWarm,2,423,2854935,978129,5163
+2026-02-18T13:55:20Z,43a2907,darwin,arm64,go1.25.0,BenchmarkCodemapIsStaleWarm,3,424,2819523,977348,5163
+2026-02-18T13:55:20Z,43a2907,darwin,arm64,go1.25.0,BenchmarkCodemapEnsureUpToDateWarm,1,411,2847034,982434,5163
+2026-02-18T13:55:20Z,43a2907,darwin,arm64,go1.25.0,BenchmarkCodemapEnsureUpToDateWarm,2,420,2864432,984117,5163
+2026-02-18T13:55:20Z,43a2907,darwin,arm64,go1.25.0,BenchmarkCodemapEnsureUpToDateWarm,3,418,3018021,983092,5163
+2026-02-18T13:55:20Z,43a2907,darwin,arm64,go1.25.0,BenchmarkCodemapEnsureUpToDateOnChange,1,213,5376260,1892051,22229
+2026-02-18T13:55:20Z,43a2907,darwin,arm64,go1.25.0,BenchmarkCodemapEnsureUpToDateOnChange,2,214,5936518,1905613,22231
+2026-02-18T13:55:20Z,43a2907,darwin,arm64,go1.25.0,BenchmarkCodemapEnsureUpToDateOnChange,3,216,5868170,1901630,22230

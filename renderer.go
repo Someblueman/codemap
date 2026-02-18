@@ -205,14 +205,13 @@ func generateOutputs(
 	}
 	prevState := mergeStateWithAnalysis(state, analysisCache)
 
-	analyzer := GoAnalyzer{}
-	cm, err := analyzer.Analyze(ctx, AnalysisInput{
+	cm, err := AnalyzeWithRegistry(ctx, AnalysisInput{
 		Root:      root,
 		Index:     idx,
 		Options:   opts,
 		PrevState: prevState,
 		NextState: nextState,
-	})
+	}, DefaultAnalyzerRegistry())
 	if err != nil {
 		return nil, false, fmt.Errorf("analyze: %w", err)
 	}
@@ -277,14 +276,13 @@ func Generate(ctx context.Context, opts Options) (*Codemap, error) {
 	}
 
 	prevState := mergeStateWithAnalysis(state, analysisCache)
-	analyzer := GoAnalyzer{}
-	cm, err := analyzer.Analyze(ctx, AnalysisInput{
+	cm, err := AnalyzeWithRegistry(ctx, AnalysisInput{
 		Root:      root,
 		Index:     idx,
 		Options:   opts,
 		PrevState: prevState,
 		NextState: nextState,
-	})
+	}, DefaultAnalyzerRegistry())
 	if err != nil {
 		return nil, fmt.Errorf("analyze: %w", err)
 	}

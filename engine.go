@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 )
 
 // AnalysisInput provides shared context for analyzer implementations.
@@ -19,6 +20,65 @@ type Analyzer interface {
 	Analyze(ctx context.Context, in AnalysisInput) (*Codemap, error)
 }
 
+// LanguageAnalyzer is an analyzer bound to a specific language.
+type LanguageAnalyzer interface {
+	Analyzer
+	LanguageID() string
+}
+
+// AnalyzerRegistry stores language-specific analyzers.
+type AnalyzerRegistry struct {
+	analyzers map[string]LanguageAnalyzer
+}
+
+// NewAnalyzerRegistry constructs an empty analyzer registry.
+func NewAnalyzerRegistry() *AnalyzerRegistry {
+	return &AnalyzerRegistry{
+		analyzers: make(map[string]LanguageAnalyzer),
+	}
+}
+
+// Register adds or replaces an analyzer for a language.
+func (r *AnalyzerRegistry) Register(analyzer LanguageAnalyzer) {
+	if r == nil || analyzer == nil {
+		return
+	}
+	r.analyzers[analyzer.LanguageID()] = analyzer
+}
+
+// AnalyzerFor returns the analyzer registered for a language.
+func (r *AnalyzerRegistry) AnalyzerFor(languageID string) (LanguageAnalyzer, bool) {
+	if r == nil {
+		return nil, false
+	}
+	analyzer, ok := r.analyzers[languageID]
+	return analyzer, ok
+}
+
+// DefaultAnalyzerRegistry returns the current built-in analyzer registry.
+func DefaultAnalyzerRegistry() *AnalyzerRegistry {
+	registry := NewAnalyzerRegistry()
+	registry.Register(GoAnalyzer{})
+	return registry
+}
+
+// AnalyzeWithRegistry selects a language analyzer from the index and runs analysis.
+func AnalyzeWithRegistry(ctx context.Context, in AnalysisInput, registry *AnalyzerRegistry) (*Codemap, error) {
+	if in.Index == nil {
+		return nil, errors.New("missing file index")
+	}
+	if registry == nil {
+		registry = DefaultAnalyzerRegistry()
+	}
+
+	languageID := dominantLanguage(in.Index, languageGo)
+	analyzer, ok := registry.AnalyzerFor(languageID)
+	if !ok {
+		return nil, fmt.Errorf("no analyzer registered for language: %s", languageID)
+	}
+	return analyzer.Analyze(ctx, in)
+}
+
 // Renderer formats a codemap model into an output artifact.
 type Renderer interface {
 	Name() string
@@ -28,6 +88,8 @@ type Renderer interface {
 
 // GoAnalyzer is the default analyzer implementation for Go projects.
 type GoAnalyzer struct{}
+
+func (GoAnalyzer) LanguageID() string { return languageGo }
 
 func (GoAnalyzer) Analyze(ctx context.Context, in AnalysisInput) (*Codemap, error) {
 	if in.Index == nil {
