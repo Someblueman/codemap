@@ -6,9 +6,20 @@ This directory tracks `codemap` benchmark trends over time.
 
 Benchmarks in `perf_benchmark_test.go`:
 
+Go fixture:
 - `BenchmarkCodemapIsStaleWarm`: `IsStale` on an unchanged repository with state cache.
 - `BenchmarkCodemapEnsureUpToDateWarm`: `EnsureUpToDate` on an unchanged repository.
 - `BenchmarkCodemapEnsureUpToDateOnChange`: `EnsureUpToDate` after a source-file change.
+
+Rust fixture:
+- `BenchmarkCodemapRustIsStaleWarm`
+- `BenchmarkCodemapRustEnsureUpToDateWarm`
+- `BenchmarkCodemapRustEnsureUpToDateOnChange`
+
+TypeScript fixture:
+- `BenchmarkCodemapTypeScriptIsStaleWarm`
+- `BenchmarkCodemapTypeScriptEnsureUpToDateWarm`
+- `BenchmarkCodemapTypeScriptEnsureUpToDateOnChange`
 
 ## Record a run
 

@@ -109,7 +109,7 @@ If `CODEMAP.md` / `CODEMAP.paths` are ignored, the hook still refreshes them loc
 
 ## Performance Tracking
 
-You can track codemap performance over time using built-in benchmarks:
+You can track codemap performance over time using built-in benchmarks (Go, Rust, and TypeScript fixture repos):
 
 ```bash
 ./scripts/perf-record.sh
