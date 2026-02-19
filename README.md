@@ -8,6 +8,7 @@ A CLI tool that analyzes Go, Rust, and TypeScript codebases and generates a smal
 ## Installation
 
 `codemap` is implemented in Go. Building from source or using `go install` requires a Go toolchain (see `go.mod` for the current minimum version).
+Rust and TypeScript symbol extraction uses Tree-sitter via CGO, so builds also require a working C toolchain.
 
 ```bash
 go install github.com/Someblueman/codemap@latest

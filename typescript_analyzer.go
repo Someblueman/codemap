@@ -8,19 +8,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
-)
 
-var (
-	tsExportClassRE     = regexp.MustCompile(`^\s*export\s+(?:default\s+)?class\s+([A-Za-z_$][A-Za-z0-9_$]*)`)
-	tsExportInterfaceRE = regexp.MustCompile(`^\s*export\s+interface\s+([A-Za-z_$][A-Za-z0-9_$]*)`)
-	tsExportTypeRE      = regexp.MustCompile(`^\s*export\s+type\s+([A-Za-z_$][A-Za-z0-9_$]*)`)
-	tsExportEnumRE      = regexp.MustCompile(`^\s*export\s+enum\s+([A-Za-z_$][A-Za-z0-9_$]*)`)
-	tsExportFnRE        = regexp.MustCompile(`^\s*export\s+(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)`)
-	tsExportVarRE       = regexp.MustCompile(`^\s*export\s+(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)`)
-	tsImportRE          = regexp.MustCompile(`^\s*import(?:[\s\w{},*$]+from\s+)?["']([^"']+)["']`)
+	sitter "github.com/tree-sitter/go-tree-sitter"
 )
 
 // TypeScriptAnalyzer is the analyzer implementation for TypeScript projects.
@@ -178,7 +169,7 @@ func analyzeTypeScriptPackage(root string, plan packagePlan, packageName string,
 			purpose = filePurpose
 		}
 
-		typeInfos, keyTypes, keyFuncs, imports := parseTypeScriptFileSymbols(content)
+		typeInfos, keyTypes, keyFuncs, imports := parseTypeScriptFileSymbols(content, withinPackage)
 		allTypes = append(allTypes, typeInfos...)
 		for _, imp := range imports {
 			importsSeen[imp] = struct{}{}
@@ -297,61 +288,217 @@ func isTypeScriptTestPath(relPath string, fileMatchTest bool) bool {
 	return strings.HasPrefix(lower, "__tests__/") || strings.Contains(lower, "/__tests__/")
 }
 
-func parseTypeScriptFileSymbols(content []byte) ([]TypeInfo, []string, []string, []string) {
+func parseTypeScriptFileSymbols(content []byte, filePath string) ([]TypeInfo, []string, []string, []string) {
 	typeInfos := make([]TypeInfo, 0)
 	keyTypes := make([]string, 0)
 	keyFuncs := make([]string, 0)
 	imports := make([]string, 0)
 
-	scanner := bufio.NewScanner(bytes.NewReader(content))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "//") {
+	parser, err := newTypeScriptParser(isTypeScriptTSXPath(filePath))
+	if err != nil {
+		return typeInfos, keyTypes, keyFuncs, imports
+	}
+	defer parser.Close()
+
+	tree := parser.Parse(content, nil)
+	if tree == nil {
+		return typeInfos, keyTypes, keyFuncs, imports
+	}
+	defer tree.Close()
+
+	root := tree.RootNode()
+	if root == nil {
+		return typeInfos, keyTypes, keyFuncs, imports
+	}
+
+	for i := uint(0); i < root.NamedChildCount(); i++ {
+		stmt := root.NamedChild(i)
+		if stmt == nil {
 			continue
 		}
 
-		if matches := tsExportClassRE.FindStringSubmatch(line); len(matches) == 2 {
-			name := matches[1]
-			typeInfos = append(typeInfos, TypeInfo{Name: name, Kind: "class"})
-			keyTypes = append(keyTypes, name)
-			continue
-		}
-		if matches := tsExportInterfaceRE.FindStringSubmatch(line); len(matches) == 2 {
-			name := matches[1]
-			typeInfos = append(typeInfos, TypeInfo{Name: name, Kind: "interface"})
-			keyTypes = append(keyTypes, name)
-			continue
-		}
-		if matches := tsExportTypeRE.FindStringSubmatch(line); len(matches) == 2 {
-			name := matches[1]
-			typeInfos = append(typeInfos, TypeInfo{Name: name, Kind: "type"})
-			keyTypes = append(keyTypes, name)
-			continue
-		}
-		if matches := tsExportEnumRE.FindStringSubmatch(line); len(matches) == 2 {
-			name := matches[1]
-			typeInfos = append(typeInfos, TypeInfo{Name: name, Kind: "enum"})
-			keyTypes = append(keyTypes, name)
-			continue
-		}
-		if matches := tsExportFnRE.FindStringSubmatch(line); len(matches) == 2 {
-			keyFuncs = append(keyFuncs, matches[1])
-			continue
-		}
-		if matches := tsExportVarRE.FindStringSubmatch(line); len(matches) == 2 {
-			keyFuncs = append(keyFuncs, matches[1])
-			continue
-		}
-		if matches := tsImportRE.FindStringSubmatch(line); len(matches) == 2 {
-			target := strings.TrimSpace(matches[1])
-			if strings.HasPrefix(target, ".") {
+		switch stmt.Kind() {
+		case "import_statement":
+			if target := typeScriptRelativeSource(stmt, content); target != "" {
 				imports = append(imports, target)
 			}
-			continue
+		case "export_statement":
+			exportTypes, exportKeyTypes, exportKeyFuncs := parseTypeScriptExportStatement(stmt, content)
+			typeInfos = append(typeInfos, exportTypes...)
+			keyTypes = append(keyTypes, exportKeyTypes...)
+			keyFuncs = append(keyFuncs, exportKeyFuncs...)
+			if target := typeScriptRelativeSource(stmt, content); target != "" {
+				imports = append(imports, target)
+			}
 		}
 	}
 
 	return typeInfos, keyTypes, keyFuncs, imports
+}
+
+func parseTypeScriptExportStatement(stmt *sitter.Node, content []byte) ([]TypeInfo, []string, []string) {
+	typeInfos := make([]TypeInfo, 0)
+	keyTypes := make([]string, 0)
+	keyFuncs := make([]string, 0)
+
+	declaration := stmt.ChildByFieldName("declaration")
+	if declaration != nil {
+		switch declaration.Kind() {
+		case "class_declaration":
+			typeScriptAppendTypeInfo(declaration, content, "class", &typeInfos, &keyTypes)
+		case "interface_declaration":
+			typeScriptAppendTypeInfo(declaration, content, "interface", &typeInfos, &keyTypes)
+		case "type_alias_declaration":
+			typeScriptAppendTypeInfo(declaration, content, "type", &typeInfos, &keyTypes)
+		case "enum_declaration":
+			typeScriptAppendTypeInfo(declaration, content, "enum", &typeInfos, &keyTypes)
+		case "function_declaration":
+			name := typeScriptDeclarationName(declaration, content)
+			if name != "" {
+				keyFuncs = append(keyFuncs, name)
+			}
+		case "lexical_declaration", "variable_declaration":
+			keyFuncs = append(keyFuncs, typeScriptVariableDeclaratorNames(declaration, content)...)
+		}
+	}
+
+	value := stmt.ChildByFieldName("value")
+	if value != nil {
+		switch value.Kind() {
+		case "function_expression", "arrow_function":
+			keyFuncs = append(keyFuncs, "default")
+		case "class":
+			typeInfos = append(typeInfos, TypeInfo{Name: "default", Kind: "class"})
+			keyTypes = append(keyTypes, "default")
+		}
+	}
+
+	for i := uint(0); i < stmt.NamedChildCount(); i++ {
+		child := stmt.NamedChild(i)
+		if child == nil {
+			continue
+		}
+		switch child.Kind() {
+		case "export_clause":
+			keyFuncs = append(keyFuncs, typeScriptExportClauseNames(child, content)...)
+		case "namespace_export":
+			name := typeScriptNamespaceExportName(child, content)
+			if name != "" {
+				keyFuncs = append(keyFuncs, name)
+			}
+		}
+	}
+
+	return typeInfos, keyTypes, keyFuncs
+}
+
+func typeScriptAppendTypeInfo(node *sitter.Node, content []byte, kind string, typeInfos *[]TypeInfo, keyTypes *[]string) {
+	name := typeScriptDeclarationName(node, content)
+	if name == "" {
+		return
+	}
+	*typeInfos = append(*typeInfos, TypeInfo{Name: name, Kind: kind})
+	*keyTypes = append(*keyTypes, name)
+}
+
+func typeScriptDeclarationName(node *sitter.Node, content []byte) string {
+	if node == nil {
+		return ""
+	}
+	nameNode := node.ChildByFieldName("name")
+	if nameNode == nil {
+		return ""
+	}
+	return strings.TrimSpace(nodeText(nameNode, content))
+}
+
+func typeScriptVariableDeclaratorNames(declaration *sitter.Node, content []byte) []string {
+	if declaration == nil {
+		return nil
+	}
+	names := make([]string, 0)
+	for i := uint(0); i < declaration.NamedChildCount(); i++ {
+		child := declaration.NamedChild(i)
+		if child == nil || child.Kind() != "variable_declarator" {
+			continue
+		}
+		nameNode := child.ChildByFieldName("name")
+		if nameNode == nil {
+			continue
+		}
+		names = append(names, typeScriptBindingIdentifiers(nameNode, content)...)
+	}
+	return names
+}
+
+func typeScriptBindingIdentifiers(node *sitter.Node, content []byte) []string {
+	if node == nil {
+		return nil
+	}
+	switch node.Kind() {
+	case "identifier", "shorthand_property_identifier_pattern":
+		name := strings.TrimSpace(nodeText(node, content))
+		if name == "" {
+			return nil
+		}
+		return []string{name}
+	default:
+		out := make([]string, 0, node.NamedChildCount())
+		for i := uint(0); i < node.NamedChildCount(); i++ {
+			out = append(out, typeScriptBindingIdentifiers(node.NamedChild(i), content)...)
+		}
+		return out
+	}
+}
+
+func typeScriptExportClauseNames(clause *sitter.Node, content []byte) []string {
+	names := make([]string, 0)
+	if clause == nil {
+		return names
+	}
+	for i := uint(0); i < clause.NamedChildCount(); i++ {
+		spec := clause.NamedChild(i)
+		if spec == nil || spec.Kind() != "export_specifier" {
+			continue
+		}
+		nameNode := spec.ChildByFieldName("alias")
+		if nameNode == nil {
+			nameNode = spec.ChildByFieldName("name")
+		}
+		if nameNode == nil {
+			continue
+		}
+		name := strings.TrimSpace(nodeText(nameNode, content))
+		if name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+func typeScriptNamespaceExportName(node *sitter.Node, content []byte) string {
+	if node == nil {
+		return ""
+	}
+	if node.NamedChildCount() == 0 {
+		return ""
+	}
+	return strings.TrimSpace(nodeText(node.NamedChild(0), content))
+}
+
+func typeScriptRelativeSource(node *sitter.Node, content []byte) string {
+	if node == nil {
+		return ""
+	}
+	source := node.ChildByFieldName("source")
+	if source == nil {
+		return ""
+	}
+	target := unquoteStringLiteral(nodeText(source, content))
+	if strings.HasPrefix(target, ".") {
+		return target
+	}
+	return ""
 }
 
 func extractTypeScriptFilePurpose(content []byte) string {
