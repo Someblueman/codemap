@@ -7,18 +7,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
-)
 
-var (
-	rustPubStructRE = regexp.MustCompile(`^\s*pub(?:\([^)]*\))?\s+struct\s+([A-Za-z_][A-Za-z0-9_]*)`)
-	rustPubEnumRE   = regexp.MustCompile(`^\s*pub(?:\([^)]*\))?\s+enum\s+([A-Za-z_][A-Za-z0-9_]*)`)
-	rustPubTraitRE  = regexp.MustCompile(`^\s*pub(?:\([^)]*\))?\s+trait\s+([A-Za-z_][A-Za-z0-9_]*)`)
-	rustPubTypeRE   = regexp.MustCompile(`^\s*pub(?:\([^)]*\))?\s+type\s+([A-Za-z_][A-Za-z0-9_]*)`)
-	rustPubFnRE     = regexp.MustCompile(`^\s*pub(?:\([^)]*\))?\s+(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)`)
-	rustUseRE       = regexp.MustCompile(`^\s*use\s+(crate|super)::([^;]+);`)
+	sitter "github.com/tree-sitter/go-tree-sitter"
 )
 
 // RustAnalyzer is the analyzer implementation for Rust projects.
@@ -325,51 +317,183 @@ func parseRustFileSymbols(content []byte) ([]TypeInfo, []string, []string, []str
 	keyTypes := make([]string, 0)
 	keyFuncs := make([]string, 0)
 	imports := make([]string, 0)
+	parser, err := newRustParser()
+	if err != nil {
+		return typeInfos, keyTypes, keyFuncs, imports
+	}
+	defer parser.Close()
 
-	scanner := bufio.NewScanner(bytes.NewReader(content))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "//") {
-			continue
-		}
+	tree := parser.Parse(content, nil)
+	if tree == nil {
+		return typeInfos, keyTypes, keyFuncs, imports
+	}
+	defer tree.Close()
 
-		if matches := rustPubStructRE.FindStringSubmatch(line); len(matches) == 2 {
-			name := matches[1]
-			typeInfos = append(typeInfos, TypeInfo{Name: name, Kind: "struct"})
-			keyTypes = append(keyTypes, name)
-			continue
-		}
-		if matches := rustPubEnumRE.FindStringSubmatch(line); len(matches) == 2 {
-			name := matches[1]
-			typeInfos = append(typeInfos, TypeInfo{Name: name, Kind: "enum"})
-			keyTypes = append(keyTypes, name)
-			continue
-		}
-		if matches := rustPubTraitRE.FindStringSubmatch(line); len(matches) == 2 {
-			name := matches[1]
-			typeInfos = append(typeInfos, TypeInfo{Name: name, Kind: "trait"})
-			keyTypes = append(keyTypes, name)
-			continue
-		}
-		if matches := rustPubTypeRE.FindStringSubmatch(line); len(matches) == 2 {
-			name := matches[1]
-			typeInfos = append(typeInfos, TypeInfo{Name: name, Kind: "type"})
-			keyTypes = append(keyTypes, name)
-			continue
-		}
-		if matches := rustPubFnRE.FindStringSubmatch(line); len(matches) == 2 {
-			keyFuncs = append(keyFuncs, matches[1])
-			continue
-		}
-		if matches := rustUseRE.FindStringSubmatch(line); len(matches) == 3 {
-			path := strings.TrimSpace(matches[1] + "::" + matches[2])
-			path = strings.ReplaceAll(path, " ", "")
-			imports = append(imports, path)
-			continue
-		}
+	root := tree.RootNode()
+	if root == nil {
+		return typeInfos, keyTypes, keyFuncs, imports
 	}
 
+	walkTreePreOrder(root, func(node *sitter.Node) {
+		switch node.Kind() {
+		case "struct_item":
+			rustAppendTypeInfo(node, content, "struct", &typeInfos, &keyTypes)
+		case "enum_item":
+			rustAppendTypeInfo(node, content, "enum", &typeInfos, &keyTypes)
+		case "trait_item":
+			rustAppendTypeInfo(node, content, "trait", &typeInfos, &keyTypes)
+		case "type_item":
+			rustAppendTypeInfo(node, content, "type", &typeInfos, &keyTypes)
+		case "function_item":
+			if !rustNodeIsExported(node) {
+				return
+			}
+			name := rustNodeName(node, content)
+			if name != "" {
+				keyFuncs = append(keyFuncs, name)
+			}
+		case "use_declaration":
+			argument := node.ChildByFieldName("argument")
+			if argument == nil {
+				return
+			}
+			paths := rustUsePathLeaves(argument, content)
+			for _, path := range paths {
+				path = strings.ReplaceAll(strings.TrimSpace(path), " ", "")
+				if strings.HasPrefix(path, "crate::") || strings.HasPrefix(path, "super::") {
+					imports = append(imports, path)
+				}
+			}
+		}
+	})
+
 	return typeInfos, keyTypes, keyFuncs, imports
+}
+
+func rustAppendTypeInfo(node *sitter.Node, content []byte, kind string, typeInfos *[]TypeInfo, keyTypes *[]string) {
+	if !rustNodeIsExported(node) {
+		return
+	}
+	name := rustNodeName(node, content)
+	if name == "" {
+		return
+	}
+	*typeInfos = append(*typeInfos, TypeInfo{Name: name, Kind: kind})
+	*keyTypes = append(*keyTypes, name)
+}
+
+func rustNodeIsExported(node *sitter.Node) bool {
+	if node == nil {
+		return false
+	}
+	for i := uint(0); i < node.ChildCount(); i++ {
+		child := node.Child(i)
+		if child != nil && child.Kind() == "visibility_modifier" {
+			return true
+		}
+	}
+	return false
+}
+
+func rustNodeName(node *sitter.Node, content []byte) string {
+	if node == nil {
+		return ""
+	}
+	nameNode := node.ChildByFieldName("name")
+	if nameNode == nil {
+		return ""
+	}
+	return strings.TrimSpace(nodeText(nameNode, content))
+}
+
+func rustUsePathLeaves(node *sitter.Node, content []byte) []string {
+	if node == nil {
+		return nil
+	}
+
+	switch node.Kind() {
+	case "identifier", "crate", "super", "self":
+		text := strings.TrimSpace(nodeText(node, content))
+		if text == "" {
+			return nil
+		}
+		return []string{text}
+	case "scoped_identifier":
+		base := rustUsePathLeaves(node.ChildByFieldName("path"), content)
+		name := rustUsePathLeaves(node.ChildByFieldName("name"), content)
+		return rustCombineUsePaths(base, name)
+	case "scoped_use_list":
+		base := rustUsePathLeaves(node.ChildByFieldName("path"), content)
+		list := rustUsePathLeaves(node.ChildByFieldName("list"), content)
+		return rustCombineUsePaths(base, list)
+	case "use_list":
+		out := make([]string, 0, node.NamedChildCount())
+		for i := uint(0); i < node.NamedChildCount(); i++ {
+			out = append(out, rustUsePathLeaves(node.NamedChild(i), content)...)
+		}
+		return out
+	case "use_as_clause":
+		return rustUsePathLeaves(node.ChildByFieldName("path"), content)
+	case "use_wildcard":
+		if node.NamedChildCount() == 0 {
+			return []string{"*"}
+		}
+		out := make([]string, 0, node.NamedChildCount())
+		for i := uint(0); i < node.NamedChildCount(); i++ {
+			for _, base := range rustUsePathLeaves(node.NamedChild(i), content) {
+				base = strings.TrimSpace(base)
+				if base != "" {
+					out = append(out, base+"::*")
+				}
+			}
+		}
+		return out
+	default:
+		if node.NamedChildCount() == 0 {
+			text := strings.TrimSpace(nodeText(node, content))
+			if text == "" {
+				return nil
+			}
+			return []string{text}
+		}
+		out := make([]string, 0, node.NamedChildCount())
+		for i := uint(0); i < node.NamedChildCount(); i++ {
+			out = append(out, rustUsePathLeaves(node.NamedChild(i), content)...)
+		}
+		return out
+	}
+}
+
+func rustCombineUsePaths(prefixes, suffixes []string) []string {
+	if len(prefixes) == 0 {
+		return append([]string(nil), suffixes...)
+	}
+	if len(suffixes) == 0 {
+		return append([]string(nil), prefixes...)
+	}
+
+	out := make([]string, 0, len(prefixes)*len(suffixes))
+	for _, prefix := range prefixes {
+		prefix = strings.TrimSuffix(strings.TrimSpace(prefix), "::")
+		for _, suffix := range suffixes {
+			suffix = strings.TrimPrefix(strings.TrimSpace(suffix), "::")
+			switch {
+			case suffix == "self":
+				if prefix != "" {
+					out = append(out, prefix)
+				}
+			case prefix == "":
+				if suffix != "" {
+					out = append(out, suffix)
+				}
+			case suffix == "":
+				out = append(out, prefix)
+			default:
+				out = append(out, prefix+"::"+suffix)
+			}
+		}
+	}
+	return out
 }
 
 func extractRustFilePurpose(content []byte) string {

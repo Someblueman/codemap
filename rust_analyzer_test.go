@@ -225,13 +225,14 @@ func TestIsRustTestPathHeuristics(t *testing.T) {
 func TestParseRustFileSymbolsExtractsTypesFuncsAndImports(t *testing.T) {
 	content := []byte(`
 pub struct Service {}
-pub enum Mode { Fast }
-pub trait Runner {}
-pub type AppResult = Result<(), String>;
+pub(crate) enum Mode { Fast }
+pub(super) trait Runner {}
+pub(in crate::feature) type AppResult = Result<(), String>;
 pub async fn run() {}
 use crate::core::Service;
 use super::helpers::Tool;
-`)
+use crate::feature::{Runner, Mode as PublicMode};
+	`)
 
 	types, keyTypes, keyFuncs, imports := parseRustFileSymbols(content)
 
@@ -242,7 +243,12 @@ use super::helpers::Tool;
 	if !reflect.DeepEqual(keyFuncs, []string{"run"}) {
 		t.Fatalf("unexpected key funcs: %v", keyFuncs)
 	}
-	if !reflect.DeepEqual(imports, []string{"crate::core::Service", "super::helpers::Tool"}) {
+	if !reflect.DeepEqual(imports, []string{
+		"crate::core::Service",
+		"super::helpers::Tool",
+		"crate::feature::Runner",
+		"crate::feature::Mode",
+	}) {
 		t.Fatalf("unexpected imports: %v", imports)
 	}
 	if len(types) != 4 {

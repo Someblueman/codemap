@@ -235,22 +235,36 @@ export type ID = string;
 export enum Mode { Fast }
 export function start() {}
 export const VERSION = "1.0.0";
-`)
+export default () => 1;
+export { Utility as Helper } from "./utility";
+export * as ns from "./namespace";
+	`)
 
-	types, keyTypes, keyFuncs, imports := parseTypeScriptFileSymbols(content)
+	types, keyTypes, keyFuncs, imports := parseTypeScriptFileSymbols(content, "src/index.ts")
 
 	wantTypes := []string{"App", "Config", "ID", "Mode"}
 	if !reflect.DeepEqual(keyTypes, wantTypes) {
 		t.Fatalf("unexpected key types: got %v want %v", keyTypes, wantTypes)
 	}
-	if !reflect.DeepEqual(keyFuncs, []string{"start", "VERSION"}) {
+	if !reflect.DeepEqual(keyFuncs, []string{"start", "VERSION", "default", "Helper", "ns"}) {
 		t.Fatalf("unexpected key funcs: %v", keyFuncs)
 	}
-	if !reflect.DeepEqual(imports, []string{"./helper"}) {
+	if !reflect.DeepEqual(imports, []string{"./helper", "./utility", "./namespace"}) {
 		t.Fatalf("unexpected imports: %v", imports)
 	}
 	if len(types) != 4 {
 		t.Fatalf("expected 4 type infos, got %d", len(types))
+	}
+}
+
+func TestParseTypeScriptFileSymbolsUsesTSXGrammarForTSXFiles(t *testing.T) {
+	content := []byte(`
+export default () => <div />;
+`)
+
+	_, _, keyFuncs, _ := parseTypeScriptFileSymbols(content, "src/app.tsx")
+	if !reflect.DeepEqual(keyFuncs, []string{"default"}) {
+		t.Fatalf("unexpected key funcs: %v", keyFuncs)
 	}
 }
 
