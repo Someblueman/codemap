@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+
+	codemap "github.com/Someblueman/codemap/internal/codemap"
 )
 
 func main() {
-	opts := DefaultOptions()
+	opts := codemap.DefaultOptions()
 
 	flag.StringVar(&opts.ProjectRoot, "root", ".", "Project root directory")
 	flag.StringVar(&opts.OutputPath, "output", "CODEMAP.md", "Output file")
@@ -26,7 +28,7 @@ func main() {
 	defer cancel()
 
 	if *check {
-		stale, err := IsStale(ctx, opts)
+		stale, err := codemap.IsStale(ctx, opts)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(2)
@@ -40,15 +42,15 @@ func main() {
 	}
 
 	var (
-		cm        *Codemap
+		cm        *codemap.Codemap
 		generated bool
 		err       error
 	)
 	if *force {
-		cm, err = Generate(ctx, opts)
+		cm, err = codemap.Generate(ctx, opts)
 		generated = true
 	} else {
-		cm, generated, err = EnsureUpToDate(ctx, opts)
+		cm, generated, err = codemap.EnsureUpToDate(ctx, opts)
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)

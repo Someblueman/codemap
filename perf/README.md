@@ -45,11 +45,25 @@ Outputs:
 ./scripts/perf-report.sh
 ```
 
-This prints latest `ns/op` and delta against the previous sample per benchmark.
+This prints:
+
+- per-benchmark latest `ns/op` / `B/op` / `allocs/op` and delta against previous sample
+- a language-group snapshot by scenario (`Go`, `Rust`, `TypeScript`) with `Rust/Go` and `TS/Go` ratios
+
+## Compare PR vs base with benchstat
+
+```bash
+go install golang.org/x/perf/cmd/benchstat@latest
+./scripts/perf-benchstat.sh origin/main
+```
+
+This runs benchmark samples on the provided base ref and current `HEAD`, then outputs a `benchstat` report under `perf/history/`.
 
 ## CI
 
 GitHub Actions workflow `.github/workflows/perf-bench.yml` runs these benchmarks on pull requests, `main` pushes, and manual dispatch, then uploads benchmark artifacts.
+
+On pull requests, CI also runs `benchstat` against the PR base branch and includes a base-vs-PR diff in the workflow summary.
 
 For persistent trend updates in git, workflow `.github/workflows/perf-history-cadence.yml` runs weekly (Monday 14:00 UTC) and opens/updates a PR with the new `perf/history.csv` sample.
 
