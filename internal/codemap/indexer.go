@@ -143,5 +143,5 @@ func BuildFileIndexWithLanguages(ctx context.Context, root string, languageSpecs
 }
 
 func isExcludedDir(name string) bool {
-	return strings.HasPrefix(name, ".") || name == "vendor" || name == "testdata" || name == "workspace"
+	return strings.HasPrefix(name, ".") || name == "vendor" || name == "testdata" || name == "workspace" || name == "node_modules"
 }

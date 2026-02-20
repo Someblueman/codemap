@@ -71,6 +71,7 @@ The generated outputs include:
 - `CODEMAP.paths`: One line per package with a suggested entry file (and optional short purpose).
 - `CODEMAP.md`: A small summary table with package entry points, plus a brief concern count summary.
 - `.codemap.state.json`: Local incremental hash cache used to speed up `codemap -check` and unchanged runs.
+- `.codemap.state.analysis.json`: Local package-analysis cache used to speed up repeated language analysis.
 
 Example output:
 
@@ -105,7 +106,7 @@ cp /path/to/codemap/scripts/pre-commit .git/hooks/pre-commit
 chmod +x .git/hooks/pre-commit
 ```
 
-The installer also adds `.codemap.state.json` to the target repo `.gitignore`.
+The installer also adds `.codemap.state.json` and `.codemap.state.analysis.json` to the target repo `.gitignore`.
 If `CODEMAP.md` / `CODEMAP.paths` are ignored, the hook still refreshes them locally and skips staging.
 
 ## Performance Tracking
@@ -189,6 +190,7 @@ The following directories are automatically excluded:
 - `vendor`
 - `testdata`
 - `workspace`
+- `node_modules`
 
 ## License
 

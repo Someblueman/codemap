@@ -25,11 +25,17 @@ func TestBuildFileIndexExcludesKnownDirs(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(tmpDir, "workspace"), 0755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(filepath.Join(tmpDir, "node_modules"), 0755); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := os.WriteFile(filepath.Join(tmpDir, "main.go"), []byte("package main\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(tmpDir, "vendor", "dep.go"), []byte("package dep\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "node_modules", "dep.ts"), []byte("export const dep = 1\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(tmpDir, ".hidden", "x.go"), []byte("package hidden\n"), 0644); err != nil {
@@ -46,7 +52,7 @@ func TestBuildFileIndexExcludesKnownDirs(t *testing.T) {
 		if rec.RelPath == "main.go" {
 			seenMain = true
 		}
-		if rec.RelPath == "vendor/dep.go" || rec.RelPath == ".hidden/x.go" {
+		if rec.RelPath == "vendor/dep.go" || rec.RelPath == "node_modules/dep.ts" || rec.RelPath == ".hidden/x.go" {
 			t.Fatalf("unexpected excluded file in index: %s", rec.RelPath)
 		}
 	}
