@@ -98,7 +98,10 @@ func BuildFileIndexWithLanguages(ctx context.Context, root string, languageSpecs
 		}
 
 		name := d.Name()
-		langMatch, ok := matchLanguageForPath(name, languageSpecs)
+		langMatch, ok, err := detectLanguageForFile(path, name, languageSpecs)
+		if err != nil {
+			return err
+		}
 		if !ok {
 			return nil
 		}

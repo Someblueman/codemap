@@ -16,16 +16,16 @@ func TestResolveLanguageSpecsDefaultsToGo(t *testing.T) {
 }
 
 func TestResolveLanguageSpecsSupportsAliasesAndDedupes(t *testing.T) {
-	specs, err := resolveLanguageSpecs([]string{"go", "ts", "rust", "go"})
+	specs, err := resolveLanguageSpecs([]string{"go", "ts", "rust", "go", "py", "bash", "python"})
 	if err != nil {
 		t.Fatalf("resolveLanguageSpecs returned error: %v", err)
 	}
-	if len(specs) != 3 {
-		t.Fatalf("expected 3 resolved languages, got %d", len(specs))
+	if len(specs) != 5 {
+		t.Fatalf("expected 5 resolved languages, got %d", len(specs))
 	}
 
-	got := []string{specs[0].ID, specs[1].ID, specs[2].ID}
-	want := []string{languageGo, languageRust, languageTypeScript}
+	got := []string{specs[0].ID, specs[1].ID, specs[2].ID, specs[3].ID, specs[4].ID}
+	want := []string{languageGo, languagePython, languageRust, languageShell, languageTypeScript}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("expected resolved language %q at index %d, got %q", want[i], i, got[i])
@@ -34,7 +34,7 @@ func TestResolveLanguageSpecsSupportsAliasesAndDedupes(t *testing.T) {
 }
 
 func TestResolveLanguageSpecsRejectsUnknown(t *testing.T) {
-	if _, err := resolveLanguageSpecs([]string{"python"}); err == nil {
+	if _, err := resolveLanguageSpecs([]string{"java"}); err == nil {
 		t.Fatal("expected error for unsupported language")
 	}
 }
@@ -54,6 +54,22 @@ func TestMatchLanguageForPathDetectsTests(t *testing.T) {
 	}
 	if tsMatch.ID != languageTypeScript || !tsMatch.IsTest {
 		t.Fatalf("unexpected TypeScript match: %#v", tsMatch)
+	}
+
+	pyMatch, ok := matchLanguageForPath("test_service.py", allBuiltinLanguageSpecs())
+	if !ok {
+		t.Fatal("expected Python file to match")
+	}
+	if pyMatch.ID != languagePython || !pyMatch.IsTest {
+		t.Fatalf("unexpected Python match: %#v", pyMatch)
+	}
+
+	shMatch, ok := matchLanguageForPath("script_test.sh", allBuiltinLanguageSpecs())
+	if !ok {
+		t.Fatal("expected shell file to match")
+	}
+	if shMatch.ID != languageShell || !shMatch.IsTest {
+		t.Fatalf("unexpected shell match: %#v", shMatch)
 	}
 }
 

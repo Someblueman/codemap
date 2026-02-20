@@ -103,7 +103,7 @@ func TestAnalyzeWithRegistryFallsBackWhenNoKnownLanguageDetected(t *testing.T) {
 
 	idx := &FileIndex{
 		Files: []FileRecord{
-			{Language: "python"},
+			{Language: "java"},
 		},
 	}
 
@@ -174,5 +174,67 @@ func TestAnalyzeIncludesPackagesFromMultipleLanguages(t *testing.T) {
 	}
 	if !foundGo || !foundTS {
 		t.Fatalf("expected both Go and TypeScript packages, got %+v", cm.Packages)
+	}
+}
+
+func TestAnalyzeIncludesPythonAndShellAndIgnoresUnsupportedFiles(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(tmpDir, "go.mod"), []byte("module example.com/mixed\n\ngo 1.25.0\n"), 0644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644); err != nil {
+		t.Fatalf("write main.go: %v", err)
+	}
+
+	pyDir := filepath.Join(tmpDir, "services", "py")
+	if err := os.MkdirAll(filepath.Join(pyDir, "src"), 0755); err != nil {
+		t.Fatalf("mkdir python src: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pyDir, "pyproject.toml"), []byte("[project]\nname = \"py-service\"\n"), 0644); err != nil {
+		t.Fatalf("write pyproject.toml: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pyDir, "src", "main.py"), []byte("def main():\n    return 1\n"), 0644); err != nil {
+		t.Fatalf("write src/main.py: %v", err)
+	}
+
+	if err := os.MkdirAll(filepath.Join(tmpDir, "scripts"), 0755); err != nil {
+		t.Fatalf("mkdir scripts: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "scripts", "deploy"), []byte("#!/usr/bin/env bash\nmain() { :; }\n"), 0755); err != nil {
+		t.Fatalf("write scripts/deploy: %v", err)
+	}
+
+	// Unsupported language files should be ignored by indexing/analyzers.
+	if err := os.MkdirAll(filepath.Join(tmpDir, "java"), 0755); err != nil {
+		t.Fatalf("mkdir java: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "java", "App.java"), []byte("class App {}\n"), 0644); err != nil {
+		t.Fatalf("write java/App.java: %v", err)
+	}
+
+	opts := DefaultOptions()
+	opts.ProjectRoot = tmpDir
+	cm, err := Analyze(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("Analyze returned error: %v", err)
+	}
+
+	var foundGo bool
+	var foundPython bool
+	var foundShell bool
+	for _, pkg := range cm.Packages {
+		if pkg.ImportPath == "example.com/mixed" {
+			foundGo = true
+		}
+		if pkg.ImportPath == "py-service" && pkg.RelativePath == "services/py" {
+			foundPython = true
+		}
+		if pkg.EntryPoint == "scripts/deploy" {
+			foundShell = true
+		}
+	}
+	if !foundGo || !foundPython || !foundShell {
+		t.Fatalf("expected Go, Python, and Shell packages, got %+v", cm.Packages)
 	}
 }

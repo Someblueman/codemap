@@ -182,6 +182,39 @@ func TestEnsureUpToDatePersistsState(t *testing.T) {
 	}
 }
 
+func TestEnsureUpToDateWithShellShebangScriptUsesStateFastPath(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(tmpDir, "deploy"), []byte("#!/usr/bin/env bash\nmain() { :; }\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := DefaultOptions()
+	opts.ProjectRoot = tmpDir
+
+	cm, generated, err := EnsureUpToDate(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("EnsureUpToDate failed: %v", err)
+	}
+	if !generated || cm == nil {
+		t.Fatal("expected first run to generate codemap outputs")
+	}
+	if len(cm.Packages) != 1 || cm.Packages[0].EntryPoint != "deploy" {
+		t.Fatalf("expected deploy script package, got %+v", cm.Packages)
+	}
+
+	cm2, generated2, err := EnsureUpToDate(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("EnsureUpToDate second run failed: %v", err)
+	}
+	if generated2 {
+		t.Fatal("expected second run to skip generation")
+	}
+	if cm2 != nil {
+		t.Fatal("expected nil codemap when no generation occurs")
+	}
+}
+
 func TestBuildConcernsFromIndex(t *testing.T) {
 	tmpDir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(tmpDir, "cmd", "app"), 0755); err != nil {
