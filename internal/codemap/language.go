@@ -9,7 +9,9 @@ import (
 
 const (
 	languageGo         = "go"
+	languagePython     = "python"
 	languageRust       = "rust"
+	languageShell      = "shell"
 	languageTypeScript = "typescript"
 )
 
@@ -65,6 +67,10 @@ func resolveLanguageSpecs(ids []string) ([]LanguageSpec, error) {
 func canonicalLanguageID(id string) string {
 	normalized := strings.ToLower(strings.TrimSpace(id))
 	switch normalized {
+	case "py", "python3":
+		return languagePython
+	case "bash", "sh":
+		return languageShell
 	case "ts":
 		return languageTypeScript
 	default:
@@ -131,10 +137,22 @@ func matchBuiltinLanguageForPath(path string) (languageMatch, bool) {
 			ID:     languageGo,
 			IsTest: strings.HasSuffix(name, "_test.go"),
 		}, true
+	case strings.HasSuffix(name, ".py"):
+		return languageMatch{
+			ID:     languagePython,
+			IsTest: isPythonTestPathLike(name),
+		}, true
 	case strings.HasSuffix(name, ".rs"):
 		return languageMatch{
 			ID:     languageRust,
 			IsTest: strings.HasSuffix(name, "_test.rs"),
+		}, true
+	case strings.HasSuffix(name, ".sh"),
+		strings.HasSuffix(name, ".bash"),
+		strings.HasSuffix(name, ".bats"):
+		return languageMatch{
+			ID:     languageShell,
+			IsTest: isShellTestPathLike(name),
 		}, true
 	case strings.HasSuffix(name, ".ts"),
 		strings.HasSuffix(name, ".tsx"),
@@ -147,6 +165,30 @@ func matchBuiltinLanguageForPath(path string) (languageMatch, bool) {
 	default:
 		return languageMatch{}, false
 	}
+}
+
+func isPythonTestPathLike(path string) bool {
+	lower := strings.ToLower(path)
+	base := filepath.Base(lower)
+	return strings.HasSuffix(base, "_test.py") ||
+		strings.HasSuffix(base, ".test.py") ||
+		strings.HasSuffix(base, ".spec.py") ||
+		(strings.HasSuffix(base, ".py") && strings.HasPrefix(base, "test_"))
+}
+
+func isShellTestPathLike(path string) bool {
+	lower := strings.ToLower(path)
+	base := filepath.Base(lower)
+	if strings.HasSuffix(base, ".bats") {
+		return true
+	}
+	return strings.HasSuffix(base, "_test.sh") ||
+		strings.HasSuffix(base, ".test.sh") ||
+		strings.HasSuffix(base, ".spec.sh") ||
+		strings.HasSuffix(base, "_test.bash") ||
+		strings.HasSuffix(base, ".test.bash") ||
+		strings.HasSuffix(base, ".spec.bash") ||
+		((strings.HasSuffix(base, ".sh") || strings.HasSuffix(base, ".bash")) && strings.HasPrefix(base, "test_"))
 }
 
 func languageEnabled(specs []LanguageSpec, id string) bool {
@@ -208,10 +250,36 @@ var builtinLanguageSpecs = map[string]LanguageSpec{
 		FileSuffixes:     []string{".go"},
 		TestFileSuffixes: []string{"_test.go"},
 	},
+	languagePython: {
+		ID:           languagePython,
+		FileSuffixes: []string{".py"},
+		TestFileSuffixes: []string{
+			"_test.py",
+			".test.py",
+			".spec.py",
+		},
+	},
 	languageRust: {
 		ID:               languageRust,
 		FileSuffixes:     []string{".rs"},
 		TestFileSuffixes: []string{"_test.rs"},
+	},
+	languageShell: {
+		ID: languageShell,
+		FileSuffixes: []string{
+			".sh",
+			".bash",
+			".bats",
+		},
+		TestFileSuffixes: []string{
+			"_test.sh",
+			".test.sh",
+			".spec.sh",
+			"_test.bash",
+			".test.bash",
+			".spec.bash",
+			".bats",
+		},
 	},
 	languageTypeScript: {
 		ID: languageTypeScript,

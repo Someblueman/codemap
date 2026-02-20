@@ -592,7 +592,7 @@ dispatch:
 }
 
 func fileEntryMatches(absRoot string, entry StateEntry) (bool, error) {
-	if _, ok := matchBuiltinLanguageForPath(entry.RelPath); !ok || entry.ContentHash == "" {
+	if entry.ContentHash == "" {
 		return false, nil
 	}
 
@@ -605,6 +605,11 @@ func fileEntryMatches(absRoot string, entry StateEntry) (bool, error) {
 		return false, err
 	}
 	if info.IsDir() {
+		return false, nil
+	}
+	if _, ok, err := detectLanguageForFile(absPath, entry.RelPath, allBuiltinLanguageSpecs()); err != nil {
+		return false, err
+	} else if !ok {
 		return false, nil
 	}
 	return info.Size() == entry.Size && info.ModTime().UnixNano() == entry.ModTimeUnixNano, nil
@@ -681,7 +686,15 @@ func buildFileIndexFromState(ctx context.Context, absRoot string, prev *CodemapS
 				unchanged.Store(false)
 			}
 
-			match, ok := matchBuiltinLanguageForPath(entry.RelPath)
+			match, ok, err := detectLanguageForFile(absPath, entry.RelPath, allBuiltinLanguageSpecs())
+			if err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				cancel()
+				return
+			}
 			if !ok {
 				match = languageMatch{}
 			}
