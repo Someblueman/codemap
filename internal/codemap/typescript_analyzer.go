@@ -28,7 +28,7 @@ func (TypeScriptAnalyzer) Analyze(ctx context.Context, in AnalysisInput) (*Codem
 
 func analyzeTypeScriptWithIndex(ctx context.Context, root string, idx *FileIndex, opts Options, prevState, nextState *CodemapState) (*Codemap, error) {
 	entryByRel := stateEntryByRelPath(nextState)
-	plans, packageNames, err := buildTypeScriptPackagePlans(root, idx, opts.IncludeTests, entryByRel)
+	plans, err := buildTypeScriptPackagePlans(root, idx, opts.IncludeTests, entryByRel)
 	if err != nil {
 		return nil, err
 	}
@@ -53,7 +53,8 @@ func analyzeTypeScriptWithIndex(ctx context.Context, root string, idx *FileIndex
 
 	if err := analyzePackagePlansParallel(ctx, opts, jobs, packageResults, func(job analysisJob) (*Package, error) {
 		plan := plans[job.index]
-		pkg, err := analyzeTypeScriptPackage(root, plan, packageNames[plan.RelativePath], opts)
+		pkgName := readTypeScriptPackageName(plan.DirAbsPath, plan.RelativePath)
+		pkg, err := analyzeTypeScriptPackage(root, plan, pkgName, opts)
 		if err != nil {
 			return nil, fmt.Errorf("analyze typescript package %s: %w", plan.RelativePath, err)
 		}
@@ -83,9 +84,20 @@ func analyzeTypeScriptWithIndex(ctx context.Context, root string, idx *FileIndex
 	}, nil
 }
 
-func buildTypeScriptPackagePlans(root string, idx *FileIndex, includeTests bool, entriesByRel map[string]StateEntry) ([]packagePlan, map[string]string, error) {
+func buildTypeScriptPackagePlans(root string, idx *FileIndex, includeTests bool, entriesByRel map[string]StateEntry) ([]packagePlan, error) {
 	plansByRel := make(map[string]*packagePlan)
-	packageNames := make(map[string]string)
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return nil, fmt.Errorf("resolve root: %w", err)
+	}
+	rootByDir := map[string]string{
+		rootAbs: rootAbs,
+	}
+	manifestExistsByRel := make(map[string]bool)
+	packageRootBySourceDir := make(map[string]struct {
+		rel string
+		abs string
+	})
 
 	for _, rec := range idx.Files {
 		if rec.Language != languageTypeScript {
@@ -95,10 +107,55 @@ func buildTypeScriptPackagePlans(root string, idx *FileIndex, includeTests bool,
 			continue
 		}
 
-		pkgRel, pkgAbs, err := findTypeScriptPackageRoot(root, rec.AbsPath)
-		if err != nil {
-			return nil, nil, err
+		sourceDir := filepath.Dir(rec.AbsPath)
+		pkgRoot, ok := packageRootBySourceDir[sourceDir]
+		if !ok {
+			if guessedRel, guessed := likelyTypeScriptPackageRootRel(rec.RelPath); guessed {
+				useGuess := pathContainsSegment(rec.RelPath, "src")
+				if !useGuess {
+					exists, err := manifestExistsAtCached(rootAbs, guessedRel, "package.json", manifestExistsByRel)
+					if err != nil {
+						return nil, err
+					}
+					useGuess = exists
+				}
+				if useGuess {
+					guessedAbs := rootAbs
+					if guessedRel != "." {
+						guessedAbs = filepath.Join(rootAbs, filepath.FromSlash(guessedRel))
+					}
+					pkgRoot = struct {
+						rel string
+						abs string
+					}{
+						rel: guessedRel,
+						abs: guessedAbs,
+					}
+					packageRootBySourceDir[sourceDir] = pkgRoot
+				}
+			}
 		}
+		if !ok {
+			if pkgRoot.rel == "" {
+				pkgAbs, err := resolveManifestRootDirCached(rootAbs, sourceDir, "package.json", rootByDir)
+				if err != nil {
+					return nil, err
+				}
+				pkgRel, err := relativePathWithinRoot(rootAbs, pkgAbs)
+				if err != nil {
+					return nil, err
+				}
+				pkgRoot = struct {
+					rel string
+					abs string
+				}{
+					rel: pkgRel,
+					abs: pkgAbs,
+				}
+				packageRootBySourceDir[sourceDir] = pkgRoot
+			}
+		}
+		pkgRel, pkgAbs := pkgRoot.rel, pkgRoot.abs
 
 		plan, ok := plansByRel[pkgRel]
 		if !ok {
@@ -108,7 +165,6 @@ func buildTypeScriptPackagePlans(root string, idx *FileIndex, includeTests bool,
 				FileRelPaths: make([]string, 0, 4),
 			}
 			plansByRel[pkgRel] = plan
-			packageNames[pkgRel] = readTypeScriptPackageName(pkgAbs, pkgRel)
 		}
 		plan.FileRelPaths = append(plan.FileRelPaths, rec.RelPath)
 	}
@@ -127,7 +183,7 @@ func buildTypeScriptPackagePlans(root string, idx *FileIndex, includeTests bool,
 		plans = append(plans, *plan)
 	}
 
-	return plans, packageNames, nil
+	return plans, nil
 }
 
 func analyzeTypeScriptPackage(root string, plan packagePlan, packageName string, opts Options) (*Package, error) {
@@ -145,6 +201,16 @@ func analyzeTypeScriptPackage(root string, plan packagePlan, packageName string,
 	purpose := ""
 	entryPoint := ""
 	entryScore := -1
+	var tsParser *sitter.Parser
+	var tsxParser *sitter.Parser
+	defer func() {
+		if tsParser != nil {
+			tsParser.Close()
+		}
+		if tsxParser != nil {
+			tsxParser.Close()
+		}
+	}()
 
 	for _, relPath := range fileRelPaths {
 		absPath := filepath.Join(root, filepath.FromSlash(relPath))
@@ -169,7 +235,20 @@ func analyzeTypeScriptPackage(root string, plan packagePlan, packageName string,
 			purpose = filePurpose
 		}
 
-		typeInfos, keyTypes, keyFuncs, imports := parseTypeScriptFileSymbols(content, withinPackage)
+		parser := tsParser
+		if isTypeScriptTSXPath(withinPackage) {
+			if tsxParser == nil {
+				tsxParser, _ = newTypeScriptParser(true)
+			}
+			parser = tsxParser
+		} else {
+			if tsParser == nil {
+				tsParser, _ = newTypeScriptParser(false)
+			}
+			parser = tsParser
+		}
+
+		typeInfos, keyTypes, keyFuncs, imports := parseTypeScriptFileSymbolsWithParser(content, parser)
 		allTypes = append(allTypes, typeInfos...)
 		for _, imp := range imports {
 			importsSeen[imp] = struct{}{}
@@ -289,16 +368,23 @@ func isTypeScriptTestPath(relPath string, fileMatchTest bool) bool {
 }
 
 func parseTypeScriptFileSymbols(content []byte, filePath string) ([]TypeInfo, []string, []string, []string) {
+	parser, err := newTypeScriptParser(isTypeScriptTSXPath(filePath))
+	if err != nil {
+		return nil, nil, nil, nil
+	}
+	defer parser.Close()
+
+	return parseTypeScriptFileSymbolsWithParser(content, parser)
+}
+
+func parseTypeScriptFileSymbolsWithParser(content []byte, parser *sitter.Parser) ([]TypeInfo, []string, []string, []string) {
 	typeInfos := make([]TypeInfo, 0)
 	keyTypes := make([]string, 0)
 	keyFuncs := make([]string, 0)
 	imports := make([]string, 0)
-
-	parser, err := newTypeScriptParser(isTypeScriptTSXPath(filePath))
-	if err != nil {
+	if parser == nil {
 		return typeInfos, keyTypes, keyFuncs, imports
 	}
-	defer parser.Close()
 
 	tree := parser.Parse(content, nil)
 	if tree == nil {

@@ -374,16 +374,27 @@ func buildConcerns(idx *FileIndex, defs []ConcernDef, exampleLimit int) ([]Conce
 }
 
 type concernMatcher struct {
-	pattern   string
-	hasDouble bool
-	prefix    string
-	suffix    string
+	pattern          string
+	patternSimple    simpleGlob
+	hasPatternSimple bool
+	hasDouble        bool
+	prefix           string
+	suffix           string
+	suffixSimple     simpleGlob
+	hasSuffixSimple  bool
 }
 
 func compileConcernPattern(pattern string) (concernMatcher, error) {
 	normalized := filepath.ToSlash(pattern)
 	if !strings.Contains(normalized, "**") {
-		return concernMatcher{pattern: normalized}, nil
+		matcher := concernMatcher{pattern: normalized}
+		if !strings.Contains(normalized, "/") {
+			if simple, ok := compileSimpleGlob(normalized); ok {
+				matcher.patternSimple = simple
+				matcher.hasPatternSimple = true
+			}
+		}
+		return matcher, nil
 	}
 
 	parts := strings.Split(normalized, "**")
@@ -391,12 +402,19 @@ func compileConcernPattern(pattern string) (concernMatcher, error) {
 		return concernMatcher{}, fmt.Errorf("unsupported pattern: %s", pattern)
 	}
 
-	return concernMatcher{
+	matcher := concernMatcher{
 		pattern:   normalized,
 		hasDouble: true,
 		prefix:    strings.TrimSuffix(parts[0], "/"),
 		suffix:    strings.TrimPrefix(parts[1], "/"),
-	}, nil
+	}
+	if !strings.Contains(matcher.suffix, "/") {
+		if simple, ok := compileSimpleGlob(matcher.suffix); ok {
+			matcher.suffixSimple = simple
+			matcher.hasSuffixSimple = true
+		}
+	}
+	return matcher, nil
 }
 
 func (m concernMatcher) matches(relPath string) bool {
@@ -408,12 +426,84 @@ func (m concernMatcher) matches(relPath string) bool {
 		if m.suffix == "" {
 			return true
 		}
-		matched, err := path.Match(m.suffix, path.Base(relPath))
+		base := path.Base(relPath)
+		if m.hasSuffixSimple {
+			return m.suffixSimple.match(base)
+		}
+		matched, err := path.Match(m.suffix, base)
 		return err == nil && matched
 	}
 
+	if m.hasPatternSimple {
+		return m.patternSimple.match(relPath)
+	}
 	matched, err := path.Match(m.pattern, relPath)
 	return err == nil && matched
+}
+
+type simpleGlob struct {
+	parts         []string
+	anchoredStart bool
+	anchoredEnd   bool
+	hasSlash      bool
+}
+
+func compileSimpleGlob(pattern string) (simpleGlob, bool) {
+	if strings.ContainsAny(pattern, "?[\\") {
+		return simpleGlob{}, false
+	}
+
+	glob := simpleGlob{
+		anchoredStart: !strings.HasPrefix(pattern, "*"),
+		anchoredEnd:   !strings.HasSuffix(pattern, "*"),
+		hasSlash:      strings.Contains(pattern, "/"),
+	}
+	if pattern == "" {
+		return glob, true
+	}
+
+	if !strings.Contains(pattern, "*") {
+		glob.parts = []string{pattern}
+		return glob, true
+	}
+
+	segments := strings.Split(pattern, "*")
+	glob.parts = make([]string, 0, len(segments))
+	for _, segment := range segments {
+		if segment != "" {
+			glob.parts = append(glob.parts, segment)
+		}
+	}
+	return glob, true
+}
+
+func (g simpleGlob) match(value string) bool {
+	if strings.Contains(value, "/") && !g.hasSlash {
+		return false
+	}
+	if len(g.parts) == 0 {
+		if g.anchoredStart && g.anchoredEnd {
+			return value == ""
+		}
+		return true
+	}
+
+	searchStart := 0
+	for i, part := range g.parts {
+		pos := strings.Index(value[searchStart:], part)
+		if pos < 0 {
+			return false
+		}
+		if i == 0 && g.anchoredStart && pos != 0 {
+			return false
+		}
+		searchStart += pos + len(part)
+	}
+
+	if g.anchoredEnd {
+		return strings.HasSuffix(value, g.parts[len(g.parts)-1])
+	}
+	return true
 }
 
 func matchPattern(root, pattern string) ([]string, error) {
@@ -477,6 +567,128 @@ func stateEntryByRelPath(state *CodemapState) map[string]StateEntry {
 		entriesByRel[entry.RelPath] = entry
 	}
 	return entriesByRel
+}
+
+func resolveManifestRootDirCached(rootAbs, startDir, manifestName string, rootsByDir map[string]string) (string, error) {
+	dir := startDir
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(rootAbs, dir)
+	}
+	dir = filepath.Clean(dir)
+
+	visited := make([]string, 0, 8)
+	for {
+		if cachedRoot, ok := rootsByDir[dir]; ok {
+			for _, visitedDir := range visited {
+				rootsByDir[visitedDir] = cachedRoot
+			}
+			return cachedRoot, nil
+		}
+		visited = append(visited, dir)
+
+		manifestPath := filepath.Join(dir, manifestName)
+		info, err := os.Stat(manifestPath)
+		if err == nil {
+			if !info.IsDir() {
+				for _, visitedDir := range visited {
+					rootsByDir[visitedDir] = dir
+				}
+				return dir, nil
+			}
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+
+		if dir == rootAbs {
+			break
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+
+	for _, visitedDir := range visited {
+		rootsByDir[visitedDir] = rootAbs
+	}
+	return rootAbs, nil
+}
+
+func relativePathWithinRoot(rootAbs, dirAbs string) (string, error) {
+	if dirAbs == rootAbs {
+		return ".", nil
+	}
+	rel, err := filepath.Rel(rootAbs, dirAbs)
+	if err != nil {
+		return "", err
+	}
+	if rel == "." {
+		return ".", nil
+	}
+	parentPrefix := ".." + string(filepath.Separator)
+	if rel == ".." || strings.HasPrefix(rel, parentPrefix) {
+		return ".", nil
+	}
+	return filepath.ToSlash(rel), nil
+}
+
+func manifestExistsAtCached(rootAbs, relDir, manifestName string, existsByRelDir map[string]bool) (bool, error) {
+	if relDir == "" {
+		relDir = "."
+	}
+	if exists, ok := existsByRelDir[relDir]; ok {
+		return exists, nil
+	}
+
+	absDir := rootAbs
+	if relDir != "." {
+		absDir = filepath.Join(rootAbs, filepath.FromSlash(relDir))
+	}
+	info, err := os.Stat(filepath.Join(absDir, manifestName))
+	if err != nil {
+		if os.IsNotExist(err) {
+			existsByRelDir[relDir] = false
+			return false, nil
+		}
+		return false, err
+	}
+
+	exists := !info.IsDir()
+	existsByRelDir[relDir] = exists
+	return exists, nil
+}
+
+func likelyRustCrateRootRel(relPath string) (string, bool) {
+	return likelyPackageRootRelBySegments(relPath, []string{"src", "tests", "benches", "examples"})
+}
+
+func likelyTypeScriptPackageRootRel(relPath string) (string, bool) {
+	return likelyPackageRootRelBySegments(relPath, []string{"src", "test", "tests", "__tests__"})
+}
+
+func likelyPackageRootRelBySegments(relPath string, segments []string) (string, bool) {
+	normalized := filepath.ToSlash(relPath)
+	for _, segment := range segments {
+		prefix := segment + "/"
+		if strings.HasPrefix(normalized, prefix) {
+			return ".", true
+		}
+		marker := "/" + segment + "/"
+		if idx := strings.Index(normalized, marker); idx > 0 {
+			return normalized[:idx], true
+		}
+	}
+	return "", false
+}
+
+func pathContainsSegment(relPath, segment string) bool {
+	normalized := filepath.ToSlash(relPath)
+	prefix := segment + "/"
+	if strings.HasPrefix(normalized, prefix) {
+		return true
+	}
+	return strings.Contains(normalized, "/"+segment+"/")
 }
 
 func buildPackagePlansFromIndex(root string, idx *FileIndex, includeTests bool, entriesByRel map[string]StateEntry) []packagePlan {

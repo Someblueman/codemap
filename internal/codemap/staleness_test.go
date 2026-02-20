@@ -3,6 +3,7 @@ package codemap
 import (
 	"context"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"testing"
@@ -207,6 +208,49 @@ func TestBuildConcernsFromIndex(t *testing.T) {
 	}
 	if concerns[0].TotalFiles != 2 {
 		t.Fatalf("expected 2 matched files, got %d", concerns[0].TotalFiles)
+	}
+}
+
+func TestSimpleGlobMatchesPathMatch(t *testing.T) {
+	patterns := []string{
+		"",
+		"*",
+		"*.go",
+		"*_test.go",
+		"error*.go",
+		"*error*.rs",
+		"cli*.ts",
+		"*.test.ts",
+		"foo*bar*baz",
+	}
+	values := []string{
+		"",
+		"main.go",
+		"foo_test.go",
+		"error_handler.go",
+		"my_error_kind.rs",
+		"cliRunner.ts",
+		"index.test.ts",
+		"foo---bar---baz",
+		"foo---bar",
+		"cmd/app/main.go",
+	}
+
+	for _, pattern := range patterns {
+		glob, ok := compileSimpleGlob(pattern)
+		if !ok {
+			t.Fatalf("compileSimpleGlob(%q) unexpectedly failed", pattern)
+		}
+
+		for _, value := range values {
+			want, err := path.Match(pattern, value)
+			if err != nil {
+				t.Fatalf("path.Match(%q, %q) returned error: %v", pattern, value, err)
+			}
+			if got := glob.match(value); got != want {
+				t.Fatalf("pattern %q value %q: got %v, want %v", pattern, value, got, want)
+			}
+		}
 	}
 }
 

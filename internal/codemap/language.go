@@ -25,6 +25,8 @@ type languageMatch struct {
 	IsTest bool
 }
 
+var allBuiltinLanguageSpecList = buildAllBuiltinLanguageSpecs()
+
 func defaultLanguageSpecs() []LanguageSpec {
 	specs, err := resolveLanguageSpecs(DefaultAnalyzerRegistry().LanguageIDs())
 	if err != nil {
@@ -71,10 +73,21 @@ func canonicalLanguageID(id string) string {
 }
 
 func matchLanguageForPath(path string, specs []LanguageSpec) (languageMatch, bool) {
+	if builtinMatch, ok := matchBuiltinLanguageForPath(path); ok {
+		if languageEnabled(specs, builtinMatch.ID) {
+			return builtinMatch, true
+		}
+		return languageMatch{}, false
+	}
+
 	name := strings.ToLower(filepath.Base(path))
 	for _, spec := range specs {
 		for _, suffix := range spec.FileSuffixes {
-			if strings.HasSuffix(name, strings.ToLower(suffix)) {
+			lowerSuffix := suffix
+			if suffix != strings.ToLower(suffix) {
+				lowerSuffix = strings.ToLower(suffix)
+			}
+			if strings.HasSuffix(name, lowerSuffix) {
 				return languageMatch{
 					ID:     spec.ID,
 					IsTest: hasAnySuffix(name, spec.TestFileSuffixes),
@@ -86,7 +99,7 @@ func matchLanguageForPath(path string, specs []LanguageSpec) (languageMatch, boo
 }
 
 func inferLanguageForPath(path string) string {
-	match, ok := matchLanguageForPath(path, allBuiltinLanguageSpecs())
+	match, ok := matchBuiltinLanguageForPath(path)
 	if !ok {
 		return ""
 	}
@@ -94,6 +107,58 @@ func inferLanguageForPath(path string) string {
 }
 
 func allBuiltinLanguageSpecs() []LanguageSpec {
+	return allBuiltinLanguageSpecList
+}
+
+func hasAnySuffix(value string, suffixes []string) bool {
+	for _, suffix := range suffixes {
+		lowerSuffix := suffix
+		if suffix != strings.ToLower(suffix) {
+			lowerSuffix = strings.ToLower(suffix)
+		}
+		if strings.HasSuffix(value, lowerSuffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchBuiltinLanguageForPath(path string) (languageMatch, bool) {
+	name := strings.ToLower(filepath.Base(path))
+	switch {
+	case strings.HasSuffix(name, ".go"):
+		return languageMatch{
+			ID:     languageGo,
+			IsTest: strings.HasSuffix(name, "_test.go"),
+		}, true
+	case strings.HasSuffix(name, ".rs"):
+		return languageMatch{
+			ID:     languageRust,
+			IsTest: strings.HasSuffix(name, "_test.rs"),
+		}, true
+	case strings.HasSuffix(name, ".ts"),
+		strings.HasSuffix(name, ".tsx"),
+		strings.HasSuffix(name, ".mts"),
+		strings.HasSuffix(name, ".cts"):
+		return languageMatch{
+			ID:     languageTypeScript,
+			IsTest: hasAnySuffix(name, builtinLanguageSpecs[languageTypeScript].TestFileSuffixes),
+		}, true
+	default:
+		return languageMatch{}, false
+	}
+}
+
+func languageEnabled(specs []LanguageSpec, id string) bool {
+	for _, spec := range specs {
+		if spec.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func buildAllBuiltinLanguageSpecs() []LanguageSpec {
 	specs := make([]LanguageSpec, 0, len(builtinLanguageSpecs))
 	for _, spec := range builtinLanguageSpecs {
 		specs = append(specs, spec)
@@ -102,15 +167,6 @@ func allBuiltinLanguageSpecs() []LanguageSpec {
 		return specs[i].ID < specs[j].ID
 	})
 	return specs
-}
-
-func hasAnySuffix(value string, suffixes []string) bool {
-	for _, suffix := range suffixes {
-		if strings.HasSuffix(value, strings.ToLower(suffix)) {
-			return true
-		}
-	}
-	return false
 }
 
 func dominantLanguage(idx *FileIndex, fallback string) string {
