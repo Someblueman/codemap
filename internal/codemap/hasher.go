@@ -384,27 +384,114 @@ func rootEntriesMatchState(absRoot string, expected []string, ignoredRootEntries
 }
 
 func directoriesMatchState(ctx context.Context, absRoot string, dirs []DirStateEntry) (bool, error) {
-	for _, dir := range dirs {
-		select {
-		case <-ctx.Done():
-			return false, ctx.Err()
-		default:
-		}
+	if len(dirs) == 0 {
+		return true, nil
+	}
 
-		absDir := absRoot
-		if dir.RelPath != "." {
-			absDir = filepath.Join(absRoot, filepath.FromSlash(dir.RelPath))
-		}
-		info, err := os.Lstat(absDir)
-		if err != nil {
-			if os.IsNotExist(err) {
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(dirs) {
+		workers = len(dirs)
+	}
+	if workers == 1 || len(dirs) < 128 {
+		for _, dir := range dirs {
+			select {
+			case <-ctx.Done():
+				return false, ctx.Err()
+			default:
+			}
+			matched, err := directoryEntryMatches(absRoot, dir)
+			if err != nil {
+				return false, err
+			}
+			if !matched {
 				return false, nil
 			}
-			return false, err
 		}
-		if !info.IsDir() || info.ModTime().UnixNano() != dir.ModTimeUnixNano {
+		return true, nil
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	jobCh := make(chan int)
+	var mismatch atomic.Bool
+	errCh := make(chan error, 1)
+
+	var wg sync.WaitGroup
+	worker := func() {
+		defer wg.Done()
+		for idx := range jobCh {
+			if mismatch.Load() {
+				return
+			}
+			matched, err := directoryEntryMatches(absRoot, dirs[idx])
+			if err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				cancel()
+				return
+			}
+			if !matched {
+				mismatch.Store(true)
+				cancel()
+				return
+			}
+		}
+	}
+
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go worker()
+	}
+
+dispatch:
+	for i := range dirs {
+		select {
+		case <-ctx.Done():
+			break dispatch
+		case jobCh <- i:
+		}
+	}
+	close(jobCh)
+	wg.Wait()
+
+	select {
+	case err := <-errCh:
+		return false, err
+	default:
+	}
+	if mismatch.Load() {
+		return false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		if errors.Is(err, context.Canceled) {
 			return false, nil
 		}
+		return false, err
+	}
+
+	return true, nil
+}
+
+func directoryEntryMatches(absRoot string, dir DirStateEntry) (bool, error) {
+	absDir := absRoot
+	if dir.RelPath != "." {
+		absDir = filepath.Join(absRoot, filepath.FromSlash(dir.RelPath))
+	}
+	info, err := os.Lstat(absDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !info.IsDir() || info.ModTime().UnixNano() != dir.ModTimeUnixNano {
+		return false, nil
 	}
 	return true, nil
 }
@@ -505,7 +592,7 @@ dispatch:
 }
 
 func fileEntryMatches(absRoot string, entry StateEntry) (bool, error) {
-	if inferLanguageForPath(entry.RelPath) == "" || entry.ContentHash == "" {
+	if _, ok := matchBuiltinLanguageForPath(entry.RelPath); !ok || entry.ContentHash == "" {
 		return false, nil
 	}
 
@@ -594,8 +681,11 @@ func buildFileIndexFromState(ctx context.Context, absRoot string, prev *CodemapS
 				unchanged.Store(false)
 			}
 
-			lang := inferLanguageForPath(entry.RelPath)
-			match, _ := matchLanguageForPath(entry.RelPath, allBuiltinLanguageSpecs())
+			match, ok := matchBuiltinLanguageForPath(entry.RelPath)
+			if !ok {
+				match = languageMatch{}
+			}
+			lang := match.ID
 			fileRecords[idx] = FileRecord{
 				AbsPath:         absPath,
 				RelPath:         entry.RelPath,

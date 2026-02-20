@@ -3,6 +3,7 @@ package codemap
 import (
 	"context"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"testing"
@@ -24,11 +25,17 @@ func TestBuildFileIndexExcludesKnownDirs(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(tmpDir, "workspace"), 0755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(filepath.Join(tmpDir, "node_modules"), 0755); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := os.WriteFile(filepath.Join(tmpDir, "main.go"), []byte("package main\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(tmpDir, "vendor", "dep.go"), []byte("package dep\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "node_modules", "dep.ts"), []byte("export const dep = 1\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(tmpDir, ".hidden", "x.go"), []byte("package hidden\n"), 0644); err != nil {
@@ -45,7 +52,7 @@ func TestBuildFileIndexExcludesKnownDirs(t *testing.T) {
 		if rec.RelPath == "main.go" {
 			seenMain = true
 		}
-		if rec.RelPath == "vendor/dep.go" || rec.RelPath == ".hidden/x.go" {
+		if rec.RelPath == "vendor/dep.go" || rec.RelPath == "node_modules/dep.ts" || rec.RelPath == ".hidden/x.go" {
 			t.Fatalf("unexpected excluded file in index: %s", rec.RelPath)
 		}
 	}
@@ -207,6 +214,49 @@ func TestBuildConcernsFromIndex(t *testing.T) {
 	}
 	if concerns[0].TotalFiles != 2 {
 		t.Fatalf("expected 2 matched files, got %d", concerns[0].TotalFiles)
+	}
+}
+
+func TestSimpleGlobMatchesPathMatch(t *testing.T) {
+	patterns := []string{
+		"",
+		"*",
+		"*.go",
+		"*_test.go",
+		"error*.go",
+		"*error*.rs",
+		"cli*.ts",
+		"*.test.ts",
+		"foo*bar*baz",
+	}
+	values := []string{
+		"",
+		"main.go",
+		"foo_test.go",
+		"error_handler.go",
+		"my_error_kind.rs",
+		"cliRunner.ts",
+		"index.test.ts",
+		"foo---bar---baz",
+		"foo---bar",
+		"cmd/app/main.go",
+	}
+
+	for _, pattern := range patterns {
+		glob, ok := compileSimpleGlob(pattern)
+		if !ok {
+			t.Fatalf("compileSimpleGlob(%q) unexpectedly failed", pattern)
+		}
+
+		for _, value := range values {
+			want, err := path.Match(pattern, value)
+			if err != nil {
+				t.Fatalf("path.Match(%q, %q) returned error: %v", pattern, value, err)
+			}
+			if got := glob.match(value); got != want {
+				t.Fatalf("pattern %q value %q: got %v, want %v", pattern, value, got, want)
+			}
+		}
 	}
 }
 

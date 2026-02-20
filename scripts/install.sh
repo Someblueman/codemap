@@ -82,16 +82,19 @@ ensure_gitignore_entry() {
   fi
 
   if ! grep -Fxq "${entry}" "${file_path}"; then
-    {
-      echo ""
-      echo "# codemap local cache"
-      echo "${entry}"
-    } >>"${file_path}"
+    if ! grep -Fxq "# codemap local cache" "${file_path}"; then
+      {
+        echo ""
+        echo "# codemap local cache"
+      } >>"${file_path}"
+    fi
+    echo "${entry}" >>"${file_path}"
   fi
 }
 
 ensure_gitignore_entry "${target_root}/.gitignore" ".codemap.state.json"
+ensure_gitignore_entry "${target_root}/.gitignore" ".codemap.state.analysis.json"
 
 (cd "${target_root}" && git add .gitignore 2>/dev/null || true)
 
-echo "Updated .gitignore with .codemap.state.json ignore rule."
+echo "Updated .gitignore with codemap state ignore rules."

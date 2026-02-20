@@ -27,7 +27,7 @@ func (RustAnalyzer) Analyze(ctx context.Context, in AnalysisInput) (*Codemap, er
 
 func analyzeRustWithIndex(ctx context.Context, root string, idx *FileIndex, opts Options, prevState, nextState *CodemapState) (*Codemap, error) {
 	entryByRel := stateEntryByRelPath(nextState)
-	plans, crateNames, err := buildRustPackagePlans(root, idx, opts.IncludeTests, entryByRel)
+	plans, err := buildRustPackagePlans(root, idx, opts.IncludeTests, entryByRel)
 	if err != nil {
 		return nil, err
 	}
@@ -52,7 +52,8 @@ func analyzeRustWithIndex(ctx context.Context, root string, idx *FileIndex, opts
 
 	if err := analyzePackagePlansParallel(ctx, opts, jobs, packageResults, func(job analysisJob) (*Package, error) {
 		plan := plans[job.index]
-		pkg, err := analyzeRustPackage(root, plan, crateNames[plan.RelativePath], opts)
+		crateName := readRustCrateName(plan.DirAbsPath, plan.RelativePath)
+		pkg, err := analyzeRustPackage(root, plan, crateName, opts)
 		if err != nil {
 			return nil, fmt.Errorf("analyze rust package %s: %w", plan.RelativePath, err)
 		}
@@ -82,9 +83,20 @@ func analyzeRustWithIndex(ctx context.Context, root string, idx *FileIndex, opts
 	}, nil
 }
 
-func buildRustPackagePlans(root string, idx *FileIndex, includeTests bool, entriesByRel map[string]StateEntry) ([]packagePlan, map[string]string, error) {
+func buildRustPackagePlans(root string, idx *FileIndex, includeTests bool, entriesByRel map[string]StateEntry) ([]packagePlan, error) {
 	plansByRel := make(map[string]*packagePlan)
-	crateNames := make(map[string]string)
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return nil, fmt.Errorf("resolve root: %w", err)
+	}
+	rootByDir := map[string]string{
+		rootAbs: rootAbs,
+	}
+	manifestExistsByRel := make(map[string]bool)
+	crateRootBySourceDir := make(map[string]struct {
+		rel string
+		abs string
+	})
 
 	for _, rec := range idx.Files {
 		if rec.Language != languageRust {
@@ -94,10 +106,55 @@ func buildRustPackagePlans(root string, idx *FileIndex, includeTests bool, entri
 			continue
 		}
 
-		crateRel, crateAbs, err := findRustCrateRoot(root, rec.AbsPath)
-		if err != nil {
-			return nil, nil, err
+		sourceDir := filepath.Dir(rec.AbsPath)
+		crateRoot, ok := crateRootBySourceDir[sourceDir]
+		if !ok {
+			if guessedRel, guessed := likelyRustCrateRootRel(rec.RelPath); guessed {
+				useGuess := pathContainsSegment(rec.RelPath, "src")
+				if !useGuess {
+					exists, err := manifestExistsAtCached(rootAbs, guessedRel, "Cargo.toml", manifestExistsByRel)
+					if err != nil {
+						return nil, err
+					}
+					useGuess = exists
+				}
+				if useGuess {
+					guessedAbs := rootAbs
+					if guessedRel != "." {
+						guessedAbs = filepath.Join(rootAbs, filepath.FromSlash(guessedRel))
+					}
+					crateRoot = struct {
+						rel string
+						abs string
+					}{
+						rel: guessedRel,
+						abs: guessedAbs,
+					}
+					crateRootBySourceDir[sourceDir] = crateRoot
+				}
+			}
 		}
+		if !ok {
+			if crateRoot.rel == "" {
+				crateAbs, err := resolveManifestRootDirCached(rootAbs, sourceDir, "Cargo.toml", rootByDir)
+				if err != nil {
+					return nil, err
+				}
+				crateRel, err := relativePathWithinRoot(rootAbs, crateAbs)
+				if err != nil {
+					return nil, err
+				}
+				crateRoot = struct {
+					rel string
+					abs string
+				}{
+					rel: crateRel,
+					abs: crateAbs,
+				}
+				crateRootBySourceDir[sourceDir] = crateRoot
+			}
+		}
+		crateRel, crateAbs := crateRoot.rel, crateRoot.abs
 
 		plan, ok := plansByRel[crateRel]
 		if !ok {
@@ -107,7 +164,6 @@ func buildRustPackagePlans(root string, idx *FileIndex, includeTests bool, entri
 				FileRelPaths: make([]string, 0, 4),
 			}
 			plansByRel[crateRel] = plan
-			crateNames[crateRel] = readRustCrateName(crateAbs, crateRel)
 		}
 		plan.FileRelPaths = append(plan.FileRelPaths, rec.RelPath)
 	}
@@ -126,7 +182,7 @@ func buildRustPackagePlans(root string, idx *FileIndex, includeTests bool, entri
 		plans = append(plans, *plan)
 	}
 
-	return plans, crateNames, nil
+	return plans, nil
 }
 
 func analyzeRustPackage(root string, plan packagePlan, crateName string, opts Options) (*Package, error) {
@@ -144,6 +200,10 @@ func analyzeRustPackage(root string, plan packagePlan, crateName string, opts Op
 	purpose := ""
 	entryPoint := ""
 	entryScore := -1
+	parser, _ := newRustParser()
+	if parser != nil {
+		defer parser.Close()
+	}
 
 	for _, relPath := range fileRelPaths {
 		absPath := filepath.Join(root, filepath.FromSlash(relPath))
@@ -168,7 +228,7 @@ func analyzeRustPackage(root string, plan packagePlan, crateName string, opts Op
 			purpose = filePurpose
 		}
 
-		typeInfos, keyTypes, keyFuncs, imports := parseRustFileSymbols(content)
+		typeInfos, keyTypes, keyFuncs, imports := parseRustFileSymbolsWithParser(content, parser)
 		allTypes = append(allTypes, typeInfos...)
 		for _, imp := range imports {
 			importsSeen[imp] = struct{}{}
@@ -313,15 +373,23 @@ func isRustTestPath(relPath string) bool {
 }
 
 func parseRustFileSymbols(content []byte) ([]TypeInfo, []string, []string, []string) {
+	parser, err := newRustParser()
+	if err != nil {
+		return nil, nil, nil, nil
+	}
+	defer parser.Close()
+
+	return parseRustFileSymbolsWithParser(content, parser)
+}
+
+func parseRustFileSymbolsWithParser(content []byte, parser *sitter.Parser) ([]TypeInfo, []string, []string, []string) {
 	typeInfos := make([]TypeInfo, 0)
 	keyTypes := make([]string, 0)
 	keyFuncs := make([]string, 0)
 	imports := make([]string, 0)
-	parser, err := newRustParser()
-	if err != nil {
+	if parser == nil {
 		return typeInfos, keyTypes, keyFuncs, imports
 	}
-	defer parser.Close()
 
 	tree := parser.Parse(content, nil)
 	if tree == nil {
