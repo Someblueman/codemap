@@ -108,11 +108,18 @@ chmod +x .git/hooks/pre-commit
 ```
 
 The installer also adds `.codemap.state.json` and `.codemap.state.analysis.json` to the target repo `.gitignore`.
-If `CODEMAP.md` / `CODEMAP.paths` are ignored, the hook still refreshes them locally and skips staging.
+It also adds `CODEMAP.md` and `CODEMAP.paths` to `.git/info/exclude` (local-only ignore).
+The pre-commit hook still refreshes `CODEMAP.md` / `CODEMAP.paths` locally, but explicitly unstages them so they are not committed.
+
+If those files are already tracked in git, untrack them once:
+
+```bash
+git rm --cached CODEMAP.md CODEMAP.paths
+```
 
 ## Performance Tracking
 
-You can track `codemap` performance over time using built-in synthetic benchmarks that exercise Go, Rust, and TypeScript fixture repos:
+You can track `codemap` performance over time using built-in synthetic benchmarks that exercise Go, Python, Rust, Shell, and TypeScript fixture repos:
 
 ```bash
 ./scripts/perf-record.sh

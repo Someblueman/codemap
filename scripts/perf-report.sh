@@ -98,41 +98,47 @@ done < "${tmp_sorted}"
 awk -F, '
 {
   bench = $1
-  if (bench ~ /^BenchmarkCodemapRust/) {
-    sub(/^BenchmarkCodemapRust/, "", bench)
-    print bench
-  } else if (bench ~ /^BenchmarkCodemapTypeScript/) {
-    sub(/^BenchmarkCodemapTypeScript/, "", bench)
-    print bench
-  } else if (bench ~ /^BenchmarkCodemap/) {
-    sub(/^BenchmarkCodemap/, "", bench)
-    print bench
+  if (bench !~ /^BenchmarkCodemap/) {
+    next
   }
+  sub(/^BenchmarkCodemap/, "", bench)
+  sub(/^(Python|Rust|Shell|TypeScript)/, "", bench)
+  print bench
 }
 ' "${tmp_sorted}" | sort -u > "${tmp_scenarios}"
 
 echo
 echo "Language Group Snapshot (Latest Sample)"
-printf "%-28s %-12s %-12s %-9s %-12s %-9s\n" "Scenario" "Go ns/op" "Rust ns/op" "Rust/Go" "TS ns/op" "TS/Go"
-printf "%-28s %-12s %-12s %-9s %-12s %-9s\n" "--------" "--------" "----------" "-------" "--------" "-----"
+printf "%-28s %-11s %-11s %-9s %-11s %-9s %-11s %-9s %-11s %-9s\n" "Scenario" "Go ns/op" "Py ns/op" "Py/Go" "Sh ns/op" "Sh/Go" "Rust ns/op" "Rust/Go" "TS ns/op" "TS/Go"
+printf "%-28s %-11s %-11s %-9s %-11s %-9s %-11s %-9s %-11s %-9s\n" "--------" "--------" "--------" "-----" "--------" "-----" "----------" "-------" "--------" "-----"
 
 while IFS= read -r scenario; do
   [[ -z "${scenario}" ]] && continue
 
   go_bench="BenchmarkCodemap${scenario}"
+  python_bench="BenchmarkCodemapPython${scenario}"
+  shell_bench="BenchmarkCodemapShell${scenario}"
   rust_bench="BenchmarkCodemapRust${scenario}"
   ts_bench="BenchmarkCodemapTypeScript${scenario}"
 
   go_ns="$(latest_ns_for_benchmark "${go_bench}")"
+  python_ns="$(latest_ns_for_benchmark "${python_bench}")"
+  shell_ns="$(latest_ns_for_benchmark "${shell_bench}")"
   rust_ns="$(latest_ns_for_benchmark "${rust_bench}")"
   ts_ns="$(latest_ns_for_benchmark "${ts_bench}")"
 
+  python_ratio="$(ratio_or_na "${python_ns}" "${go_ns}")"
+  shell_ratio="$(ratio_or_na "${shell_ns}" "${go_ns}")"
   rust_ratio="$(ratio_or_na "${rust_ns}" "${go_ns}")"
   ts_ratio="$(ratio_or_na "${ts_ns}" "${go_ns}")"
 
-  printf "%-28s %-12s %-12s %-9s %-12s %-9s\n" \
+  printf "%-28s %-11s %-11s %-9s %-11s %-9s %-11s %-9s %-11s %-9s\n" \
     "${scenario}" \
     "$(format_or_na "${go_ns}")" \
+    "$(format_or_na "${python_ns}")" \
+    "${python_ratio}" \
+    "$(format_or_na "${shell_ns}")" \
+    "${shell_ratio}" \
     "$(format_or_na "${rust_ns}")" \
     "${rust_ratio}" \
     "$(format_or_na "${ts_ns}")" \

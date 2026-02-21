@@ -203,12 +203,15 @@ main() {
 }
 `)
 
-	keyFuncs, imports := parseShellFileSymbols(content)
+	keyFuncs, imports, lineCount := parseShellFileSymbols(content)
 	if !reflect.DeepEqual(keyFuncs, []string{"run", "main"}) {
 		t.Fatalf("unexpected key funcs: %v", keyFuncs)
 	}
 	if !reflect.DeepEqual(imports, []string{"./lib.sh", "../shared/common.sh"}) {
 		t.Fatalf("unexpected imports: %v", imports)
+	}
+	if lineCount != lineCountBytes(content) {
+		t.Fatalf("unexpected line count: got %d want %d", lineCount, lineCountBytes(content))
 	}
 }
 

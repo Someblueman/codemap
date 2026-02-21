@@ -126,6 +126,10 @@ func BuildFileIndexWithLanguages(ctx context.Context, root string, languageSpecs
 			}
 		}
 
+		if shouldSkipIndexedFile(langMatch.ID, relPath, info.Size()) {
+			return nil
+		}
+
 		idx.Files = append(idx.Files, FileRecord{
 			AbsPath:         path,
 			RelPath:         relPath,
@@ -147,4 +151,11 @@ func BuildFileIndexWithLanguages(ctx context.Context, root string, languageSpecs
 
 func isExcludedDir(name string) bool {
 	return strings.HasPrefix(name, ".") || name == "vendor" || name == "testdata" || name == "workspace" || name == "node_modules"
+}
+
+func shouldSkipIndexedFile(languageID, relPath string, size int64) bool {
+	if languageID != languagePython || size != 0 {
+		return false
+	}
+	return filepath.Base(relPath) == "__init__.py"
 }
