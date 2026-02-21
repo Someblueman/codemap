@@ -11,7 +11,7 @@ if [[ -z "${target_root}" ]]; then
   fi
 fi
 
-if [[ ! -d "${target_root}/.git" ]]; then
+if ! git -C "${target_root}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "error: ${target_root} is not a git repository" >&2
   exit 1
 fi
@@ -22,9 +22,10 @@ if ! command -v codemap >/dev/null 2>&1; then
   exit 1
 fi
 
-hooks_dir="${target_root}/.git/hooks"
+hooks_dir="$(git -C "${target_root}" rev-parse --git-path hooks)"
 hook_path="${hooks_dir}/pre-commit"
 template_path="${script_dir}/pre-commit"
+local_exclude_path="$(git -C "${target_root}" rev-parse --git-path info/exclude)"
 
 mkdir -p "${hooks_dir}"
 
@@ -40,7 +41,6 @@ chmod +x "${hook_path}"
 echo "Installed pre-commit hook: ${hook_path}"
 
 (cd "${target_root}" && codemap)
-(cd "${target_root}" && git add CODEMAP.md CODEMAP.paths 2>/dev/null || true)
 
 ensure_codemap_block() {
   local file_path="$1"
@@ -92,9 +92,45 @@ ensure_gitignore_entry() {
   fi
 }
 
+ensure_local_exclude_entry() {
+  local file_path="$1"
+  local entry="$2"
+
+  if [[ ! -f "${file_path}" ]]; then
+    touch "${file_path}"
+  fi
+
+  if ! grep -Fxq "${entry}" "${file_path}"; then
+    if ! grep -Fxq "# codemap local outputs" "${file_path}"; then
+      {
+        echo ""
+        echo "# codemap local outputs"
+      } >>"${file_path}"
+    fi
+    echo "${entry}" >>"${file_path}"
+  fi
+}
+
+ensure_local_exclude_entry "${local_exclude_path}" "CODEMAP.md"
+ensure_local_exclude_entry "${local_exclude_path}" "CODEMAP.paths"
+
+tracked_outputs=()
+for output in CODEMAP.md CODEMAP.paths; do
+  if (cd "${target_root}" && git ls-files --error-unmatch "${output}" >/dev/null 2>&1); then
+    tracked_outputs+=("${output}")
+  fi
+done
+
+if [[ ${#tracked_outputs[@]} -gt 0 ]]; then
+  echo "warning: tracked codemap output files detected: ${tracked_outputs[*]}"
+  echo "warning: to keep codemap outputs local-only, run:"
+  echo "warning:   git -C \"${target_root}\" rm --cached ${tracked_outputs[*]}"
+fi
+
 ensure_gitignore_entry "${target_root}/.gitignore" ".codemap.state.json"
 ensure_gitignore_entry "${target_root}/.gitignore" ".codemap.state.analysis.json"
 
 (cd "${target_root}" && git add .gitignore 2>/dev/null || true)
 
 echo "Updated .gitignore with codemap state ignore rules."
+echo "Configured local codemap output ignore rules in ${local_exclude_path}."

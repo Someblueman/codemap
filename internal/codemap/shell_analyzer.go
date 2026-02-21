@@ -7,15 +7,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
-)
-
-var (
-	shellFuncPattern       = regexp.MustCompile(`^(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(\))?\s*\{`)
-	shellSourcePattern     = regexp.MustCompile(`^(?:source|\.)\s+([^\s;#]+)`)
-	shellIdentifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 )
 
 // ShellAnalyzer is the analyzer implementation for shell script projects.
@@ -143,25 +136,24 @@ func analyzeShellPackage(root string, plan packagePlan, packageName string, opts
 		return nil, nil
 	}
 
-	fileRelPaths := append([]string(nil), plan.FileRelPaths...)
-	sort.Strings(fileRelPaths)
-
-	files := make([]File, 0, len(fileRelPaths))
-	importsSeen := make(map[string]struct{}, len(fileRelPaths))
+	includeDetailedFiles := len(plan.FileRelPaths) >= opts.LargePackageFiles
+	var files []File
+	if includeDetailedFiles {
+		files = make([]File, 0, len(plan.FileRelPaths))
+	}
+	importsSeen := make(map[string]struct{}, len(plan.FileRelPaths))
 	totalLines := 0
 	purpose := ""
 	entryPoint := ""
 	entryScore := -1
+	firstFileName := ""
 
-	for _, relPath := range fileRelPaths {
+	for _, relPath := range plan.FileRelPaths {
 		absPath := filepath.Join(root, filepath.FromSlash(relPath))
 		content, err := os.ReadFile(absPath)
 		if err != nil {
 			return nil, fmt.Errorf("read %s: %w", relPath, err)
 		}
-
-		lineCount := lineCountBytes(content)
-		totalLines += lineCount
 
 		withinPackage := relPath
 		if plan.RelativePath != "." {
@@ -170,23 +162,29 @@ func analyzeShellPackage(root string, plan packagePlan, packageName string, opts
 				withinPackage = strings.TrimPrefix(relPath, prefix)
 			}
 		}
+		if firstFileName == "" {
+			firstFileName = withinPackage
+		}
 
 		filePurpose := extractShellFilePurpose(content)
 		if purpose == "" && filePurpose != "" {
 			purpose = filePurpose
 		}
 
-		keyFuncs, imports := parseShellFileSymbols(content)
+		keyFuncs, imports, lineCount := parseShellFileSymbols(content)
+		totalLines += lineCount
 		for _, imp := range imports {
 			importsSeen[imp] = struct{}{}
 		}
 
-		files = append(files, File{
-			Name:      withinPackage,
-			LineCount: lineCount,
-			Purpose:   filePurpose,
-			KeyFuncs:  keyFuncs,
-		})
+		if includeDetailedFiles {
+			files = append(files, File{
+				Name:      withinPackage,
+				LineCount: lineCount,
+				Purpose:   filePurpose,
+				KeyFuncs:  keyFuncs,
+			})
+		}
 
 		score := scoreShellEntryPoint(withinPackage, keyFuncs)
 		if score > entryScore || (score == entryScore && (entryPoint == "" || withinPackage < entryPoint)) {
@@ -195,8 +193,8 @@ func analyzeShellPackage(root string, plan packagePlan, packageName string, opts
 		}
 	}
 
-	if entryPoint == "" && len(files) > 0 {
-		entryPoint = files[0].Name
+	if entryPoint == "" {
+		entryPoint = firstFileName
 	}
 	if purpose == "" {
 		purpose = "Shell scripts"
@@ -212,7 +210,7 @@ func analyzeShellPackage(root string, plan packagePlan, packageName string, opts
 	sort.Strings(internalImports)
 
 	var detailedFiles []File
-	if len(files) >= opts.LargePackageFiles {
+	if includeDetailedFiles {
 		detailedFiles = files
 	}
 
@@ -220,7 +218,7 @@ func analyzeShellPackage(root string, plan packagePlan, packageName string, opts
 		ImportPath:    packageName,
 		RelativePath:  plan.RelativePath,
 		Purpose:       purpose,
-		FileCount:     len(files),
+		FileCount:     len(plan.FileRelPaths),
 		LineCount:     totalLines,
 		Files:         detailedFiles,
 		ExportedTypes: nil,
@@ -265,14 +263,14 @@ func isShellTestPath(relPath string, fileMatchTest bool) bool {
 	return isShellTestPathLike(base)
 }
 
-func parseShellFileSymbols(content []byte) ([]string, []string) {
+func parseShellFileSymbols(content []byte) ([]string, []string, int) {
 	keyFuncs := make([]string, 0)
 	imports := make([]string, 0)
-	funcsSeen := make(map[string]struct{})
-	importsSeen := make(map[string]struct{})
+	lineCount := 0
 
 	scanner := bufio.NewScanner(bytes.NewReader(content))
 	for scanner.Scan() {
+		lineCount++
 		line := scanner.Text()
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
@@ -283,31 +281,130 @@ func parseShellFileSymbols(content []byte) ([]string, []string) {
 			continue
 		}
 
-		if match := shellFuncPattern.FindStringSubmatch(trimmed); len(match) == 2 {
-			name := match[1]
-			if shellIdentifierPattern.MatchString(name) {
-				if _, exists := funcsSeen[name]; !exists {
-					funcsSeen[name] = struct{}{}
-					keyFuncs = append(keyFuncs, name)
-				}
+		if name := parseShellFuncName(trimmed); name != "" {
+			if !containsString(keyFuncs, name) {
+				keyFuncs = append(keyFuncs, name)
 			}
 			continue
 		}
 
-		if match := shellSourcePattern.FindStringSubmatch(trimmed); len(match) == 2 {
-			target := strings.TrimSpace(match[1])
-			target = strings.Trim(target, `"'`)
-			if target == "" {
-				continue
-			}
-			if _, exists := importsSeen[target]; !exists {
-				importsSeen[target] = struct{}{}
+		if target := parseShellSourceTarget(trimmed); target != "" {
+			if !containsString(imports, target) {
 				imports = append(imports, target)
 			}
 		}
 	}
 
-	return keyFuncs, imports
+	if len(content) > 0 && content[len(content)-1] == '\n' {
+		lineCount++
+	}
+
+	return keyFuncs, imports, lineCount
+}
+
+func parseShellFuncName(line string) string {
+	rest := line
+	if strings.HasPrefix(rest, "function") {
+		if len(rest) == len("function") {
+			return ""
+		}
+		next := rest[len("function")]
+		if next != ' ' && next != '\t' {
+			return ""
+		}
+		rest = strings.TrimSpace(rest[len("function"):])
+	}
+
+	name, consumed := parseShellIdentifierPrefix(rest)
+	if name == "" {
+		return ""
+	}
+
+	rest = strings.TrimSpace(rest[consumed:])
+	if strings.HasPrefix(rest, "()") {
+		rest = strings.TrimSpace(rest[2:])
+	}
+	if !strings.HasPrefix(rest, "{") {
+		return ""
+	}
+	return name
+}
+
+func parseShellSourceTarget(line string) string {
+	rest := ""
+	switch {
+	case strings.HasPrefix(line, "source"):
+		if len(line) == len("source") {
+			return ""
+		}
+		next := line[len("source")]
+		if next != ' ' && next != '\t' {
+			return ""
+		}
+		rest = strings.TrimSpace(line[len("source"):])
+	case strings.HasPrefix(line, "."):
+		if len(line) < 2 {
+			return ""
+		}
+		next := line[1]
+		if next != ' ' && next != '\t' {
+			return ""
+		}
+		rest = strings.TrimSpace(line[1:])
+	default:
+		return ""
+	}
+
+	if rest == "" {
+		return ""
+	}
+
+	end := 0
+	for end < len(rest) {
+		c := rest[end]
+		if c == ' ' || c == '\t' || c == ';' || c == '#' {
+			break
+		}
+		end++
+	}
+	if end == 0 {
+		return ""
+	}
+
+	target := strings.TrimSpace(rest[:end])
+	target = strings.Trim(target, `"'`)
+	return target
+}
+
+func parseShellIdentifierPrefix(value string) (string, int) {
+	if len(value) == 0 {
+		return "", 0
+	}
+	if !isShellIdentifierStart(value[0]) {
+		return "", 0
+	}
+	i := 1
+	for i < len(value) && isShellIdentifierChar(value[i]) {
+		i++
+	}
+	return value[:i], i
+}
+
+func isShellIdentifierStart(c byte) bool {
+	return c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+}
+
+func isShellIdentifierChar(c byte) bool {
+	return isShellIdentifierStart(c) || (c >= '0' && c <= '9')
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func extractShellFilePurpose(content []byte) string {

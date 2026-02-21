@@ -13,6 +13,8 @@ type benchmarkFixtureKind string
 
 const (
 	benchmarkFixtureGo         benchmarkFixtureKind = "go"
+	benchmarkFixturePython     benchmarkFixtureKind = "python"
+	benchmarkFixtureShell      benchmarkFixtureKind = "shell"
 	benchmarkFixtureRust       benchmarkFixtureKind = "rust"
 	benchmarkFixtureTypeScript benchmarkFixtureKind = "typescript"
 )
@@ -31,6 +33,14 @@ func BenchmarkCodemapRustIsStaleWarm(b *testing.B) {
 	benchmarkCodemapIsStaleWarm(b, benchmarkFixtureRust, 80, 6)
 }
 
+func BenchmarkCodemapPythonIsStaleWarm(b *testing.B) {
+	benchmarkCodemapIsStaleWarm(b, benchmarkFixturePython, 80, 6)
+}
+
+func BenchmarkCodemapShellIsStaleWarm(b *testing.B) {
+	benchmarkCodemapIsStaleWarm(b, benchmarkFixtureShell, 80, 6)
+}
+
 func BenchmarkCodemapTypeScriptIsStaleWarm(b *testing.B) {
 	benchmarkCodemapIsStaleWarm(b, benchmarkFixtureTypeScript, 80, 6)
 }
@@ -43,6 +53,14 @@ func BenchmarkCodemapRustEnsureUpToDateWarm(b *testing.B) {
 	benchmarkCodemapEnsureUpToDateWarm(b, benchmarkFixtureRust, 80, 6)
 }
 
+func BenchmarkCodemapPythonEnsureUpToDateWarm(b *testing.B) {
+	benchmarkCodemapEnsureUpToDateWarm(b, benchmarkFixturePython, 80, 6)
+}
+
+func BenchmarkCodemapShellEnsureUpToDateWarm(b *testing.B) {
+	benchmarkCodemapEnsureUpToDateWarm(b, benchmarkFixtureShell, 80, 6)
+}
+
 func BenchmarkCodemapTypeScriptEnsureUpToDateWarm(b *testing.B) {
 	benchmarkCodemapEnsureUpToDateWarm(b, benchmarkFixtureTypeScript, 80, 6)
 }
@@ -53,6 +71,14 @@ func BenchmarkCodemapEnsureUpToDateOnChange(b *testing.B) {
 
 func BenchmarkCodemapRustEnsureUpToDateOnChange(b *testing.B) {
 	benchmarkCodemapEnsureUpToDateOnChange(b, benchmarkFixtureRust, 40, 4)
+}
+
+func BenchmarkCodemapPythonEnsureUpToDateOnChange(b *testing.B) {
+	benchmarkCodemapEnsureUpToDateOnChange(b, benchmarkFixturePython, 40, 4)
+}
+
+func BenchmarkCodemapShellEnsureUpToDateOnChange(b *testing.B) {
+	benchmarkCodemapEnsureUpToDateOnChange(b, benchmarkFixtureShell, 40, 4)
 }
 
 func BenchmarkCodemapTypeScriptEnsureUpToDateOnChange(b *testing.B) {
@@ -146,6 +172,10 @@ func buildBenchmarkRepo(b *testing.B, kind benchmarkFixtureKind, packageCount, f
 	switch kind {
 	case benchmarkFixtureGo:
 		return buildGoBenchmarkRepo(b, root, packageCount, filesPerPackage)
+	case benchmarkFixturePython:
+		return buildPythonBenchmarkRepo(b, root, packageCount, filesPerPackage)
+	case benchmarkFixtureShell:
+		return buildShellBenchmarkRepo(b, root, packageCount, filesPerPackage)
 	case benchmarkFixtureRust:
 		return buildRustBenchmarkRepo(b, root, packageCount, filesPerPackage)
 	case benchmarkFixtureTypeScript:
@@ -268,6 +298,115 @@ pub fn benchmark_tick() -> i32 {
     %d
 }
 // change %s
+`, iteration, changeMarker)
+		},
+	}
+}
+
+func buildPythonBenchmarkRepo(b *testing.B, root string, packageCount, filesPerPackage int) benchmarkRepo {
+	b.Helper()
+
+	for p := 0; p < packageCount; p++ {
+		pkgName := fmt.Sprintf("pkg%03d", p)
+		pkgDir := filepath.Join(root, "packages", pkgName)
+		srcDir := filepath.Join(pkgDir, "src")
+		if err := os.MkdirAll(srcDir, 0755); err != nil {
+			b.Fatalf("mkdir %s: %v", srcDir, err)
+		}
+
+		manifest := fmt.Sprintf("[project]\nname = \"%s\"\nversion = \"0.1.0\"\n", pkgName)
+		if err := os.WriteFile(filepath.Join(pkgDir, "pyproject.toml"), []byte(manifest), 0644); err != nil {
+			b.Fatalf("write pyproject.toml for %s: %v", pkgName, err)
+		}
+		if err := os.WriteFile(filepath.Join(srcDir, "__init__.py"), []byte(""), 0644); err != nil {
+			b.Fatalf("write __init__.py for %s: %v", pkgName, err)
+		}
+
+		for f := 0; f < filesPerPackage; f++ {
+			typeName := fmt.Sprintf("Type%03d%02d", p, f)
+			funcName := fmt.Sprintf("make_%03d_%02d", p, f)
+			fileName := fmt.Sprintf("file%02d.py", f)
+
+			fileSrc := fmt.Sprintf(`class %s:
+    def __init__(self, value: int) -> None:
+        self.value = value
+
+
+def %s(v: int) -> %s:
+    return %s(v)
+`, typeName, funcName, typeName, typeName)
+			if err := os.WriteFile(filepath.Join(srcDir, fileName), []byte(fileSrc), 0644); err != nil {
+				b.Fatalf("write %s: %v", fileName, err)
+			}
+		}
+
+		if err := os.WriteFile(filepath.Join(srcDir, "main.py"), []byte("BENCHMARK_READY = True\n"), 0644); err != nil {
+			b.Fatalf("write main.py for %s: %v", pkgName, err)
+		}
+	}
+
+	target := filepath.Join(root, "packages", "pkg000", "src", "file00.py")
+	return benchmarkRepo{
+		root:         root,
+		changeTarget: target,
+		changeTemplate: func(iteration int) string {
+			changeMarker := strings.Repeat("x", (iteration%17)+1)
+			return fmt.Sprintf(`class BenchmarkTick:
+    def __init__(self, value: int) -> None:
+        self.value = value
+
+
+def benchmark_tick() -> int:
+    return %d
+
+
+# change %s
+`, iteration, changeMarker)
+		},
+	}
+}
+
+func buildShellBenchmarkRepo(b *testing.B, root string, packageCount, filesPerPackage int) benchmarkRepo {
+	b.Helper()
+
+	for p := 0; p < packageCount; p++ {
+		pkgName := fmt.Sprintf("pkg%03d", p)
+		scriptsDir := filepath.Join(root, "packages", pkgName, "scripts")
+		if err := os.MkdirAll(scriptsDir, 0755); err != nil {
+			b.Fatalf("mkdir %s: %v", scriptsDir, err)
+		}
+
+		if err := os.WriteFile(filepath.Join(scriptsDir, "main.sh"), []byte("#!/usr/bin/env bash\n# benchmark fixture\nset -euo pipefail\n\nrun_main() {\n  printf 'ready\\n'\n}\n"), 0644); err != nil {
+			b.Fatalf("write main.sh for %s: %v", pkgName, err)
+		}
+
+		for f := 0; f < filesPerPackage; f++ {
+			funcName := fmt.Sprintf("run_%03d_%02d", p, f)
+			fileName := fmt.Sprintf("task%02d.sh", f)
+			fileSrc := fmt.Sprintf(`#!/usr/bin/env bash
+# shell fixture for %s
+%s() {
+  printf '%d\n'
+}
+`, pkgName, funcName, f)
+			if err := os.WriteFile(filepath.Join(scriptsDir, fileName), []byte(fileSrc), 0644); err != nil {
+				b.Fatalf("write %s: %v", fileName, err)
+			}
+		}
+	}
+
+	target := filepath.Join(root, "packages", "pkg000", "scripts", "task00.sh")
+	return benchmarkRepo{
+		root:         root,
+		changeTarget: target,
+		changeTemplate: func(iteration int) string {
+			changeMarker := strings.Repeat("x", (iteration%17)+1)
+			return fmt.Sprintf(`#!/usr/bin/env bash
+# shell benchmark change fixture
+benchmark_tick() {
+  printf '%d\n'
+}
+# change %s
 `, iteration, changeMarker)
 		},
 	}

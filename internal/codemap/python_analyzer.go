@@ -13,14 +13,7 @@ import (
 )
 
 var (
-	pythonClassPattern          = regexp.MustCompile(`^class\s+([A-Za-z_][A-Za-z0-9_]*)\b`)
-	pythonFuncPattern           = regexp.MustCompile(`^def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
-	pythonAsyncFuncPattern      = regexp.MustCompile(`^async\s+def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
-	pythonImportPattern         = regexp.MustCompile(`^import\s+(.+)$`)
-	pythonFromImportPattern     = regexp.MustCompile(`^from\s+([\.A-Za-z_][A-Za-z0-9_\.]*)\s+import\s+`)
-	pythonConstantAssignPattern = regexp.MustCompile(`^([A-Z][A-Z0-9_]*)\s*=`)
-	pythonIdentifierPattern     = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
-	pythonSetupPyNamePattern    = regexp.MustCompile(`name\s*=\s*[\"']([^\"']+)[\"']`)
+	pythonSetupPyNamePattern = regexp.MustCompile(`name\s*=\s*[\"']([^\"']+)[\"']`)
 )
 
 // PythonAnalyzer is the analyzer implementation for Python projects.
@@ -62,7 +55,13 @@ func analyzePythonWithIndex(ctx context.Context, root string, idx *FileIndex, op
 
 	if err := analyzePackagePlansParallel(ctx, opts, jobs, packageResults, func(job analysisJob) (*Package, error) {
 		plan := plans[job.index]
-		packageName := readPythonPackageName(plan.DirAbsPath, plan.RelativePath)
+		packageName := ""
+		if cached, ok := cachedByRel[plan.RelativePath]; ok {
+			packageName = strings.TrimSpace(cached.Package.ImportPath)
+		}
+		if packageName == "" {
+			packageName = readPythonPackageName(plan.DirAbsPath, plan.RelativePath)
+		}
 		pkg, err := analyzePythonPackage(root, plan, packageName, opts)
 		if err != nil {
 			return nil, fmt.Errorf("analyze python package %s: %w", plan.RelativePath, err)
@@ -200,27 +199,26 @@ func analyzePythonPackage(root string, plan packagePlan, packageName string, opt
 		return nil, nil
 	}
 
-	fileRelPaths := append([]string(nil), plan.FileRelPaths...)
-	sort.Strings(fileRelPaths)
-
-	files := make([]File, 0, len(fileRelPaths))
-	allTypes := make([]TypeInfo, 0, len(fileRelPaths))
-	importsSeen := make(map[string]struct{}, len(fileRelPaths))
+	includeDetailedFiles := len(plan.FileRelPaths) >= opts.LargePackageFiles
+	var files []File
+	if includeDetailedFiles {
+		files = make([]File, 0, len(plan.FileRelPaths))
+	}
+	allTypes := make([]TypeInfo, 0, len(plan.FileRelPaths))
+	importsSeen := make(map[string]struct{}, len(plan.FileRelPaths))
 	totalLines := 0
 	purpose := ""
 	entryPoint := ""
 	entryScore := -1
+	firstFileName := ""
 	importPrefix := pythonImportPrefix(packageName, plan.RelativePath)
 
-	for _, relPath := range fileRelPaths {
+	for _, relPath := range plan.FileRelPaths {
 		absPath := filepath.Join(root, filepath.FromSlash(relPath))
 		content, err := os.ReadFile(absPath)
 		if err != nil {
 			return nil, fmt.Errorf("read %s: %w", relPath, err)
 		}
-
-		lineCount := lineCountBytes(content)
-		totalLines += lineCount
 
 		withinPackage := relPath
 		if plan.RelativePath != "." {
@@ -229,13 +227,17 @@ func analyzePythonPackage(root string, plan packagePlan, packageName string, opt
 				withinPackage = strings.TrimPrefix(relPath, prefix)
 			}
 		}
+		if firstFileName == "" {
+			firstFileName = withinPackage
+		}
 
 		filePurpose := extractPythonFilePurpose(content)
 		if purpose == "" && filePurpose != "" {
 			purpose = filePurpose
 		}
 
-		typeInfos, keyTypes, keyFuncs, imports := parsePythonFileSymbols(content, withinPackage)
+		typeInfos, keyTypes, keyFuncs, imports, lineCount := parsePythonFileSymbols(content, withinPackage)
+		totalLines += lineCount
 		allTypes = append(allTypes, typeInfos...)
 		for _, imp := range imports {
 			if isPythonInternalImport(imp, importPrefix) {
@@ -243,13 +245,15 @@ func analyzePythonPackage(root string, plan packagePlan, packageName string, opt
 			}
 		}
 
-		files = append(files, File{
-			Name:      withinPackage,
-			LineCount: lineCount,
-			Purpose:   filePurpose,
-			KeyTypes:  keyTypes,
-			KeyFuncs:  keyFuncs,
-		})
+		if includeDetailedFiles {
+			files = append(files, File{
+				Name:      withinPackage,
+				LineCount: lineCount,
+				Purpose:   filePurpose,
+				KeyTypes:  keyTypes,
+				KeyFuncs:  keyFuncs,
+			})
+		}
 
 		score := scorePythonEntryPoint(withinPackage, keyTypes, keyFuncs)
 		if score > entryScore || (score == entryScore && (entryPoint == "" || withinPackage < entryPoint)) {
@@ -258,8 +262,8 @@ func analyzePythonPackage(root string, plan packagePlan, packageName string, opt
 		}
 	}
 
-	if entryPoint == "" && len(files) > 0 {
-		entryPoint = files[0].Name
+	if entryPoint == "" {
+		entryPoint = firstFileName
 	}
 	if purpose == "" && packageName != "" {
 		purpose = "Python package " + packageName
@@ -275,7 +279,7 @@ func analyzePythonPackage(root string, plan packagePlan, packageName string, opt
 	})
 
 	var detailedFiles []File
-	if len(files) >= opts.LargePackageFiles {
+	if includeDetailedFiles {
 		detailedFiles = files
 	}
 
@@ -283,7 +287,7 @@ func analyzePythonPackage(root string, plan packagePlan, packageName string, opt
 		ImportPath:    packageName,
 		RelativePath:  plan.RelativePath,
 		Purpose:       purpose,
-		FileCount:     len(files),
+		FileCount:     len(plan.FileRelPaths),
 		LineCount:     totalLines,
 		Files:         detailedFiles,
 		ExportedTypes: allTypes,
@@ -517,18 +521,16 @@ func isPythonTestPath(relPath string, fileMatchTest bool) bool {
 	return isPythonTestPathLike(base)
 }
 
-func parsePythonFileSymbols(content []byte, _ string) ([]TypeInfo, []string, []string, []string) {
+func parsePythonFileSymbols(content []byte, _ string) ([]TypeInfo, []string, []string, []string, int) {
 	typeInfos := make([]TypeInfo, 0)
 	keyTypes := make([]string, 0)
 	keyFuncs := make([]string, 0)
 	imports := make([]string, 0)
-
-	typesSeen := make(map[string]struct{})
-	funcsSeen := make(map[string]struct{})
-	importsSeen := make(map[string]struct{})
+	lineCount := 0
 
 	scanner := bufio.NewScanner(bytes.NewReader(content))
 	for scanner.Scan() {
+		lineCount++
 		line := scanner.Text()
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
@@ -540,11 +542,9 @@ func parsePythonFileSymbols(content []byte, _ string) ([]TypeInfo, []string, []s
 			continue
 		}
 
-		if match := pythonClassPattern.FindStringSubmatch(trimmed); len(match) == 2 {
-			name := match[1]
+		if name := parsePythonClassName(trimmed); name != "" {
 			if isPublicPythonSymbol(name) {
-				if _, exists := typesSeen[name]; !exists {
-					typesSeen[name] = struct{}{}
+				if !stringSliceContains(keyTypes, name) {
 					typeInfos = append(typeInfos, TypeInfo{Name: name, Kind: "class"})
 					keyTypes = append(keyTypes, name)
 				}
@@ -552,59 +552,168 @@ func parsePythonFileSymbols(content []byte, _ string) ([]TypeInfo, []string, []s
 			continue
 		}
 
-		if match := pythonAsyncFuncPattern.FindStringSubmatch(trimmed); len(match) == 2 {
-			name := match[1]
+		if name := parsePythonFuncName(trimmed, "async def "); name != "" {
 			if isPublicPythonSymbol(name) {
-				if _, exists := funcsSeen[name]; !exists {
-					funcsSeen[name] = struct{}{}
+				if !stringSliceContains(keyFuncs, name) {
 					keyFuncs = append(keyFuncs, name)
 				}
 			}
 			continue
 		}
-		if match := pythonFuncPattern.FindStringSubmatch(trimmed); len(match) == 2 {
-			name := match[1]
+		if name := parsePythonFuncName(trimmed, "def "); name != "" {
 			if isPublicPythonSymbol(name) {
-				if _, exists := funcsSeen[name]; !exists {
-					funcsSeen[name] = struct{}{}
+				if !stringSliceContains(keyFuncs, name) {
 					keyFuncs = append(keyFuncs, name)
 				}
 			}
 			continue
 		}
 
-		if match := pythonConstantAssignPattern.FindStringSubmatch(trimmed); len(match) == 2 {
-			name := match[1]
-			if _, exists := funcsSeen[name]; !exists {
-				funcsSeen[name] = struct{}{}
+		if name := parsePythonConstName(trimmed); name != "" {
+			if !stringSliceContains(keyFuncs, name) {
 				keyFuncs = append(keyFuncs, name)
 			}
 			continue
 		}
 
-		if match := pythonFromImportPattern.FindStringSubmatch(trimmed); len(match) == 2 {
-			imp := strings.TrimSpace(match[1])
-			imp = strings.Trim(imp, "()")
-			if imp != "" {
-				if _, exists := importsSeen[imp]; !exists {
-					importsSeen[imp] = struct{}{}
-					imports = append(imports, imp)
-				}
+		if imp := parsePythonFromImport(trimmed); imp != "" {
+			if !stringSliceContains(imports, imp) {
+				imports = append(imports, imp)
 			}
 			continue
 		}
 
-		if match := pythonImportPattern.FindStringSubmatch(trimmed); len(match) == 2 {
-			for _, imp := range parsePythonImportStatement(match[1]) {
-				if _, exists := importsSeen[imp]; !exists {
-					importsSeen[imp] = struct{}{}
+		if strings.HasPrefix(trimmed, "import ") {
+			for _, imp := range parsePythonImportStatement(strings.TrimSpace(trimmed[len("import "):])) {
+				if !stringSliceContains(imports, imp) {
 					imports = append(imports, imp)
 				}
 			}
 		}
 	}
 
-	return typeInfos, keyTypes, keyFuncs, imports
+	if len(content) > 0 && content[len(content)-1] == '\n' {
+		lineCount++
+	}
+
+	return typeInfos, keyTypes, keyFuncs, imports, lineCount
+}
+
+func parsePythonClassName(line string) string {
+	if !strings.HasPrefix(line, "class ") {
+		return ""
+	}
+	name, _ := parsePythonIdentifierPrefix(strings.TrimSpace(line[len("class "):]))
+	return name
+}
+
+func parsePythonFuncName(line, prefix string) string {
+	if !strings.HasPrefix(line, prefix) {
+		return ""
+	}
+	rest := strings.TrimSpace(line[len(prefix):])
+	name, consumed := parsePythonIdentifierPrefix(rest)
+	if name == "" {
+		return ""
+	}
+	rest = strings.TrimLeft(rest[consumed:], " \t")
+	if !strings.HasPrefix(rest, "(") {
+		return ""
+	}
+	return name
+}
+
+func parsePythonConstName(line string) string {
+	if len(line) == 0 || line[0] < 'A' || line[0] > 'Z' {
+		return ""
+	}
+	i := 1
+	for i < len(line) {
+		c := line[i]
+		if (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' {
+			i++
+			continue
+		}
+		break
+	}
+	if i == 0 {
+		return ""
+	}
+	rest := strings.TrimLeft(line[i:], " \t")
+	if strings.HasPrefix(rest, "=") {
+		return line[:i]
+	}
+	return ""
+}
+
+func parsePythonFromImport(line string) string {
+	if !strings.HasPrefix(line, "from ") {
+		return ""
+	}
+
+	rest := strings.TrimSpace(line[len("from "):])
+	if rest == "" {
+		return ""
+	}
+
+	i := 0
+	for i < len(rest) {
+		c := rest[i]
+		if c == '.' || c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (i > 0 && c >= '0' && c <= '9') {
+			i++
+			continue
+		}
+		break
+	}
+	if i == 0 {
+		return ""
+	}
+
+	module := strings.TrimSpace(rest[:i])
+	if module == "" {
+		return ""
+	}
+
+	rest = strings.TrimLeft(rest[i:], " \t")
+	if !strings.HasPrefix(rest, "import") {
+		return ""
+	}
+	rest = rest[len("import"):]
+	if len(rest) == 0 || (rest[0] != ' ' && rest[0] != '\t') {
+		return ""
+	}
+	return strings.Trim(module, "()")
+}
+
+func parsePythonIdentifierPrefix(value string) (string, int) {
+	if len(value) == 0 {
+		return "", 0
+	}
+	if !isPythonIdentifierStart(value[0]) {
+		return "", 0
+	}
+	i := 1
+	for i < len(value) && isPythonIdentifierChar(value[i]) {
+		i++
+	}
+	return value[:i], i
+}
+
+func isPythonIdentifierStart(c byte) bool {
+	return c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+}
+
+func isPythonIdentifierChar(c byte) bool {
+	return isPythonIdentifierStart(c) || (c >= '0' && c <= '9')
+}
+
+func stringSliceContains(values []string, target string) bool {
+	for _, v := range values {
+		if v == target {
+			return true
+		}
+	}
+	return false
 }
 
 func parsePythonImportStatement(spec string) []string {
@@ -737,10 +846,25 @@ func normalizePythonImportPrefix(value string) string {
 	if idx := strings.Index(value, "."); idx > 0 {
 		value = value[:idx]
 	}
-	if !pythonIdentifierPattern.MatchString(value) {
+	if !isPythonIdentifier(value) {
 		return ""
 	}
 	return value
+}
+
+func isPythonIdentifier(value string) bool {
+	if len(value) == 0 {
+		return false
+	}
+	if !isPythonIdentifierStart(value[0]) {
+		return false
+	}
+	for i := 1; i < len(value); i++ {
+		if !isPythonIdentifierChar(value[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 func isPythonInternalImport(imp, prefix string) bool {

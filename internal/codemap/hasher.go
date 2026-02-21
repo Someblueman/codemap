@@ -59,6 +59,8 @@ type StateEntry struct {
 	Size            int64  `json:"size"`
 	ModTimeUnixNano int64  `json:"modTimeUnixNano"`
 	ContentHash     string `json:"contentHash"`
+	Language        string `json:"language,omitempty"`
+	IsTest          bool   `json:"isTest,omitempty"`
 }
 
 // DirStateEntry stores per-directory metadata for fast stale checks.
@@ -171,6 +173,8 @@ func computeAggregateHash(ctx context.Context, idx *FileIndex, prev *CodemapStat
 			RelPath:         rec.RelPath,
 			Size:            rec.Size,
 			ModTimeUnixNano: rec.ModTimeUnixNano,
+			Language:        rec.Language,
+			IsTest:          rec.IsTest,
 		}
 
 		cached, ok := findCachedEntry(prevEntries, rec.RelPath, &prevPos)
@@ -413,68 +417,53 @@ func directoriesMatchState(ctx context.Context, absRoot string, dirs []DirStateE
 		return true, nil
 	}
 
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	jobCh := make(chan int)
 	var mismatch atomic.Bool
-	errCh := make(chan error, 1)
+	var firstErr error
+	var errOnce sync.Once
+	setErr := func(err error) {
+		errOnce.Do(func() {
+			firstErr = err
+		})
+		mismatch.Store(true)
+	}
 
 	var wg sync.WaitGroup
-	worker := func() {
-		defer wg.Done()
-		for idx := range jobCh {
-			if mismatch.Load() {
-				return
-			}
-			matched, err := directoryEntryMatches(absRoot, dirs[idx])
-			if err != nil {
+	wg.Add(workers)
+	for workerID := 0; workerID < workers; workerID++ {
+		go func(start int) {
+			defer wg.Done()
+			for idx := start; idx < len(dirs); idx += workers {
+				if mismatch.Load() {
+					return
+				}
 				select {
-				case errCh <- err:
+				case <-ctx.Done():
+					return
 				default:
 				}
-				cancel()
-				return
+				matched, err := directoryEntryMatches(absRoot, dirs[idx])
+				if err != nil {
+					setErr(err)
+					return
+				}
+				if !matched {
+					mismatch.Store(true)
+					return
+				}
 			}
-			if !matched {
-				mismatch.Store(true)
-				cancel()
-				return
-			}
-		}
+		}(workerID)
 	}
-
-	wg.Add(workers)
-	for i := 0; i < workers; i++ {
-		go worker()
-	}
-
-dispatch:
-	for i := range dirs {
-		select {
-		case <-ctx.Done():
-			break dispatch
-		case jobCh <- i:
-		}
-	}
-	close(jobCh)
 	wg.Wait()
 
-	select {
-	case err := <-errCh:
+	if firstErr != nil {
+		return false, firstErr
+	}
+	if err := ctx.Err(); err != nil {
 		return false, err
-	default:
 	}
 	if mismatch.Load() {
 		return false, nil
 	}
-	if err := ctx.Err(); err != nil {
-		if errors.Is(err, context.Canceled) {
-			return false, nil
-		}
-		return false, err
-	}
-
 	return true, nil
 }
 
@@ -526,68 +515,53 @@ func filesMatchState(ctx context.Context, absRoot string, entries []StateEntry) 
 		return true, nil
 	}
 
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	jobCh := make(chan int)
 	var mismatch atomic.Bool
-	errCh := make(chan error, 1)
+	var firstErr error
+	var errOnce sync.Once
+	setErr := func(err error) {
+		errOnce.Do(func() {
+			firstErr = err
+		})
+		mismatch.Store(true)
+	}
 
 	var wg sync.WaitGroup
-	worker := func() {
-		defer wg.Done()
-		for idx := range jobCh {
-			if mismatch.Load() {
-				return
-			}
-			matched, err := fileEntryMatches(absRoot, entries[idx])
-			if err != nil {
+	wg.Add(workers)
+	for workerID := 0; workerID < workers; workerID++ {
+		go func(start int) {
+			defer wg.Done()
+			for idx := start; idx < len(entries); idx += workers {
+				if mismatch.Load() {
+					return
+				}
 				select {
-				case errCh <- err:
+				case <-ctx.Done():
+					return
 				default:
 				}
-				cancel()
-				return
+				matched, err := fileEntryMatches(absRoot, entries[idx])
+				if err != nil {
+					setErr(err)
+					return
+				}
+				if !matched {
+					mismatch.Store(true)
+					return
+				}
 			}
-			if !matched {
-				mismatch.Store(true)
-				cancel()
-				return
-			}
-		}
+		}(workerID)
 	}
-
-	wg.Add(workers)
-	for i := 0; i < workers; i++ {
-		go worker()
-	}
-
-dispatch:
-	for i := range entries {
-		select {
-		case <-ctx.Done():
-			break dispatch
-		case jobCh <- i:
-		}
-	}
-	close(jobCh)
 	wg.Wait()
 
-	select {
-	case err := <-errCh:
+	if firstErr != nil {
+		return false, firstErr
+	}
+	if err := ctx.Err(); err != nil {
 		return false, err
-	default:
 	}
 	if mismatch.Load() {
 		return false, nil
 	}
-	if err := ctx.Err(); err != nil {
-		if errors.Is(err, context.Canceled) {
-			return false, nil
-		}
-		return false, err
-	}
-
 	return true, nil
 }
 
@@ -607,12 +581,36 @@ func fileEntryMatches(absRoot string, entry StateEntry) (bool, error) {
 	if info.IsDir() {
 		return false, nil
 	}
-	if _, ok, err := detectLanguageForFile(absPath, entry.RelPath, allBuiltinLanguageSpecs()); err != nil {
+
+	match, err := resolveStateEntryLanguage(entry, absPath)
+	if err != nil {
 		return false, err
-	} else if !ok {
+	}
+	if match.ID == "" {
 		return false, nil
 	}
+
 	return info.Size() == entry.Size && info.ModTime().UnixNano() == entry.ModTimeUnixNano, nil
+}
+
+func resolveStateEntryLanguage(entry StateEntry, absPath string) (languageMatch, error) {
+	if entry.Language != "" {
+		return languageMatch{
+			ID:     entry.Language,
+			IsTest: entry.IsTest,
+		}, nil
+	}
+	if match, ok := matchBuiltinLanguageForPath(entry.RelPath); ok && match.ID != "" {
+		return match, nil
+	}
+	match, ok, err := detectLanguageForFile(absPath, entry.RelPath, allBuiltinLanguageSpecs())
+	if err != nil {
+		return languageMatch{}, err
+	}
+	if !ok || match.ID == "" {
+		return languageMatch{}, nil
+	}
+	return match, nil
 }
 
 func buildFileIndexFromState(ctx context.Context, absRoot string, prev *CodemapState, ignoredRootEntries map[string]struct{}) (*FileIndex, bool, error) {
@@ -649,94 +647,111 @@ func buildFileIndexFromState(ctx context.Context, absRoot string, prev *CodemapS
 		workers = len(prev.Entries)
 	}
 
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	jobCh := make(chan int)
-	errCh := make(chan error, 1)
-	var wg sync.WaitGroup
-	worker := func() {
-		defer wg.Done()
-		for idx := range jobCh {
-			entry := prev.Entries[idx]
-			absPath := filepath.Join(absRoot, filepath.FromSlash(entry.RelPath))
-			info, err := os.Lstat(absPath)
-			if err != nil {
-				if os.IsNotExist(err) {
-					treeInvalid.Store(true)
-					cancel()
-					return
-				}
-				select {
-				case errCh <- err:
-				default:
-				}
-				cancel()
-				return
-			}
-			if info.IsDir() {
+	processEntry := func(idx int) error {
+		entry := prev.Entries[idx]
+		absPath := filepath.Join(absRoot, filepath.FromSlash(entry.RelPath))
+		info, err := os.Lstat(absPath)
+		if err != nil {
+			if os.IsNotExist(err) {
 				treeInvalid.Store(true)
-				cancel()
-				return
+				return nil
 			}
+			return err
+		}
+		if info.IsDir() {
+			treeInvalid.Store(true)
+			return nil
+		}
 
-			size := info.Size()
-			modTimeUnixNano := info.ModTime().UnixNano()
-			if size != entry.Size || modTimeUnixNano != entry.ModTimeUnixNano {
-				unchanged.Store(false)
+		size := info.Size()
+		modTimeUnixNano := info.ModTime().UnixNano()
+		if size != entry.Size || modTimeUnixNano != entry.ModTimeUnixNano {
+			unchanged.Store(false)
+		}
+
+		match, err := resolveStateEntryLanguage(entry, absPath)
+		if err != nil {
+			return err
+		}
+		if match.ID == "" {
+			treeInvalid.Store(true)
+			return nil
+		}
+		lang := match.ID
+		fileRecords[idx] = FileRecord{
+			AbsPath:         absPath,
+			RelPath:         entry.RelPath,
+			Size:            size,
+			ModTimeUnixNano: modTimeUnixNano,
+			Language:        lang,
+			IsGo:            lang == languageGo,
+			IsTest:          match.IsTest,
+		}
+		return nil
+	}
+
+	if workers == 1 || len(prev.Entries) < 128 {
+		for i := range prev.Entries {
+			select {
+			case <-ctx.Done():
+				return nil, false, ctx.Err()
+			default:
 			}
+			if err := processEntry(i); err != nil {
+				return nil, false, err
+			}
+			if treeInvalid.Load() {
+				return nil, false, nil
+			}
+		}
+	} else {
+		var firstErr error
+		var errOnce sync.Once
+		setErr := func(err error) {
+			errOnce.Do(func() {
+				firstErr = err
+			})
+		}
 
-			match, ok, err := detectLanguageForFile(absPath, entry.RelPath, allBuiltinLanguageSpecs())
-			if err != nil {
-				select {
-				case errCh <- err:
-				default:
+		var stop atomic.Bool
+		var wg sync.WaitGroup
+		wg.Add(workers)
+		for workerID := 0; workerID < workers; workerID++ {
+			go func(start int) {
+				defer wg.Done()
+				for idx := start; idx < len(prev.Entries); idx += workers {
+					if stop.Load() {
+						return
+					}
+					select {
+					case <-ctx.Done():
+						stop.Store(true)
+						return
+					default:
+					}
+					if err := processEntry(idx); err != nil {
+						setErr(err)
+						stop.Store(true)
+						return
+					}
+					if treeInvalid.Load() {
+						stop.Store(true)
+						return
+					}
 				}
-				cancel()
-				return
-			}
-			if !ok {
-				match = languageMatch{}
-			}
-			lang := match.ID
-			fileRecords[idx] = FileRecord{
-				AbsPath:         absPath,
-				RelPath:         entry.RelPath,
-				Size:            size,
-				ModTimeUnixNano: modTimeUnixNano,
-				Language:        lang,
-				IsGo:            lang == languageGo,
-				IsTest:          match.IsTest,
-			}
+			}(workerID)
 		}
-	}
+		wg.Wait()
 
-	wg.Add(workers)
-	for i := 0; i < workers; i++ {
-		go worker()
-	}
-
-dispatch:
-	for i := range prev.Entries {
-		select {
-		case <-ctx.Done():
-			break dispatch
-		case jobCh <- i:
+		if firstErr != nil {
+			return nil, false, firstErr
 		}
-	}
-	close(jobCh)
-	wg.Wait()
-
-	select {
-	case err := <-errCh:
-		return nil, false, err
-	default:
-	}
-	if treeInvalid.Load() {
-		return nil, false, nil
-	}
-	if err := ctx.Err(); err != nil && !errors.Is(err, context.Canceled) {
-		return nil, false, err
+		if err := ctx.Err(); err != nil {
+			return nil, false, err
+		}
+		if treeInvalid.Load() {
+			return nil, false, nil
+		}
 	}
 
 	return &FileIndex{

@@ -31,6 +31,53 @@ func TestBuildFileIndexIncludesPythonByDefault(t *testing.T) {
 	}
 }
 
+func TestBuildFileIndexSkipsEmptyPythonInitModules(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	if err := os.MkdirAll(filepath.Join(tmpDir, "pkg"), 0755); err != nil {
+		t.Fatalf("mkdir pkg: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "pkg", "__init__.py"), nil, 0644); err != nil {
+		t.Fatalf("write __init__.py: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "pkg", "main.py"), []byte("def run():\n    return 1\n"), 0644); err != nil {
+		t.Fatalf("write main.py: %v", err)
+	}
+
+	idx, err := BuildFileIndex(context.Background(), tmpDir)
+	if err != nil {
+		t.Fatalf("BuildFileIndex returned error: %v", err)
+	}
+	if len(idx.Files) != 1 {
+		t.Fatalf("expected only non-empty python source indexed, got %d files", len(idx.Files))
+	}
+	if idx.Files[0].RelPath != "pkg/main.py" {
+		t.Fatalf("expected pkg/main.py to be indexed, got %q", idx.Files[0].RelPath)
+	}
+}
+
+func TestBuildFileIndexKeepsNonEmptyPythonInitModules(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	if err := os.MkdirAll(filepath.Join(tmpDir, "pkg"), 0755); err != nil {
+		t.Fatalf("mkdir pkg: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "pkg", "__init__.py"), []byte("__all__ = ['run']\n"), 0644); err != nil {
+		t.Fatalf("write __init__.py: %v", err)
+	}
+
+	idx, err := BuildFileIndex(context.Background(), tmpDir)
+	if err != nil {
+		t.Fatalf("BuildFileIndex returned error: %v", err)
+	}
+	if len(idx.Files) != 1 {
+		t.Fatalf("expected non-empty __init__.py to be indexed, got %d files", len(idx.Files))
+	}
+	if idx.Files[0].RelPath != "pkg/__init__.py" {
+		t.Fatalf("expected pkg/__init__.py to be indexed, got %q", idx.Files[0].RelPath)
+	}
+}
+
 func TestAnalyzePythonProject(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -258,7 +305,7 @@ def _helper():
 APP_VERSION = "1.0.0"
 `)
 
-	types, keyTypes, keyFuncs, imports := parsePythonFileSymbols(content, "src/main.py")
+	types, keyTypes, keyFuncs, imports, lineCount := parsePythonFileSymbols(content, "src/main.py")
 
 	wantTypes := []string{"Service"}
 	if !reflect.DeepEqual(keyTypes, wantTypes) {
@@ -272,6 +319,9 @@ APP_VERSION = "1.0.0"
 	}
 	if len(types) != 1 {
 		t.Fatalf("expected 1 type info, got %d", len(types))
+	}
+	if lineCount != lineCountBytes(content) {
+		t.Fatalf("unexpected line count: got %d want %d", lineCount, lineCountBytes(content))
 	}
 }
 

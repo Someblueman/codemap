@@ -8,7 +8,7 @@ if ! root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
 fi
 
 # Only run when supported source files are staged.
-if ! git diff --cached --name-only --diff-filter=ACMR | grep -qE '\.(go|rs|ts|tsx|mts|cts)$'; then
+if ! git diff --cached --name-only --diff-filter=ACMR | grep -qE '\.(go|py|rs|sh|bash|bats|ts|tsx|mts|cts)$'; then
   exit 0
 fi
 
@@ -18,17 +18,16 @@ if ! command -v codemap >/dev/null 2>&1; then
   exit 0
 fi
 
-stage_if_not_ignored() {
+unstage_output() {
   local path="$1"
-  if git check-ignore -q "${path}"; then
-    return 0
-  fi
-  git add "${path}" 2>/dev/null || true
+  git restore --staged --quiet -- "${path}" 2>/dev/null || true
+  git reset -q -- "${path}" 2>/dev/null || true
+  git rm --cached -q --ignore-unmatch -- "${path}" 2>/dev/null || true
 }
 
 (
   cd "${root}"
   codemap
-  stage_if_not_ignored CODEMAP.md
-  stage_if_not_ignored CODEMAP.paths
+  unstage_output CODEMAP.md
+  unstage_output CODEMAP.paths
 )

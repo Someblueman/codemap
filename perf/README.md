@@ -12,6 +12,16 @@ Benchmarks in `perf_benchmark_test.go`:
 - `BenchmarkCodemapEnsureUpToDateWarm`: `EnsureUpToDate` on an unchanged repository.
 - `BenchmarkCodemapEnsureUpToDateOnChange`: `EnsureUpToDate` after a source-file change.
 
+### Python Fixture
+- `BenchmarkCodemapPythonIsStaleWarm`
+- `BenchmarkCodemapPythonEnsureUpToDateWarm`
+- `BenchmarkCodemapPythonEnsureUpToDateOnChange`
+
+### Shell Fixture
+- `BenchmarkCodemapShellIsStaleWarm`
+- `BenchmarkCodemapShellEnsureUpToDateWarm`
+- `BenchmarkCodemapShellEnsureUpToDateOnChange`
+
 ### Rust Fixture
 - `BenchmarkCodemapRustIsStaleWarm`
 - `BenchmarkCodemapRustEnsureUpToDateWarm`
@@ -48,7 +58,7 @@ Outputs:
 This prints:
 
 - per-benchmark latest `ns/op` / `B/op` / `allocs/op` and delta against previous sample
-- a language-group snapshot by scenario (`Go`, `Rust`, `TypeScript`) with `Rust/Go` and `TS/Go` ratios
+- a language-group snapshot by scenario (`Go`, `Python`, `Shell`, `Rust`, `TypeScript`) with per-language ratios versus `Go`
 
 ## Compare PR vs base with benchstat
 
