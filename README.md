@@ -23,6 +23,18 @@ cd codemap
 go build -o codemap
 ```
 
+## Releases
+
+Official releases are published on GitHub:
+
+- https://github.com/Someblueman/codemap/releases
+
+Install a specific released version with Go modules:
+
+```bash
+go install github.com/Someblueman/codemap@v0.1.0
+```
+
 ## Usage
 
 ```bash
